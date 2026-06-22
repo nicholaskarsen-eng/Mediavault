@@ -1,0 +1,6 @@
+{
+  "name": "Media Vault",
+  "description": "A centralized secure media vault and cloud sync repository with intelligent AI categorization and tag organization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
