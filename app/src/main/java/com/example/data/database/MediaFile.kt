@@ -16,5 +16,7 @@ data class MediaFile(
     val syncStatus: String = "PENDING", // "PENDING", "SYNCED", "FAILED"
     val cloudUrl: String? = null,
     val aiSummary: String? = null,
-    val localUri: String? = null
+    val localUri: String? = null,
+    val md5Hash: String? = null,
+    val isDuplicate: Boolean = false
 )

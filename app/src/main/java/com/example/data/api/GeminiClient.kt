@@ -31,12 +31,47 @@ object GeminiClient {
 
     private val mediaType = "application/json; charset=utf-8".toMediaType()
 
+    private fun getBase64FromUri(context: android.content.Context, uriString: String): Pair<String, String>? {
+        try {
+            val uri = android.net.Uri.parse(uriString)
+            val mimeType = context.contentResolver.getType(uri) ?: "image/jpeg"
+            context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                val bytes = inputStream.readBytes()
+                if (mimeType.startsWith("image/")) {
+                    val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+                    val maxDim = 800
+                    val scaledBitmap = if (bitmap.width > maxDim || bitmap.height > maxDim) {
+                        val ratio = bitmap.width.toFloat() / bitmap.height.toFloat()
+                        val (newW, newH) = if (bitmap.width > bitmap.height) {
+                            Pair(maxDim, (maxDim / ratio).toInt())
+                        } else {
+                            Pair((maxDim * ratio).toInt(), maxDim)
+                        }
+                        android.graphics.Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+                    } else {
+                        bitmap
+                    }
+                    val outputStream = java.io.ByteArrayOutputStream()
+                    scaledBitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 75, outputStream)
+                    val base64 = android.util.Base64.encodeToString(outputStream.toByteArray(), android.util.Base64.NO_WRAP)
+                    return Pair(base64, "image/jpeg")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting base64 from URI: ${e.message}", e)
+        }
+        return null
+    }
+
     suspend fun organizeFile(
+        context: android.content.Context? = null,
         fileName: String,
         fileType: String,
         sourceApp: String,
         fileSizeLong: Long,
-        customRule: String? = null
+        localUri: String? = null,
+        customRule: String? = null,
+        granularity: String? = null
     ): AIOrganizationResult = withContext(Dispatchers.IO) {
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isEmpty() || apiKey == "MY_GEMINI_API_KEY") {
@@ -50,28 +85,71 @@ object GeminiClient {
             ""
         }
 
-        val prompt = """
-            You are a system file organizer. Categorize this media file and supply tags and a 1-sentence analytical description.
-            
-            File Details:
-            - Name: "$fileName"
-            - Type: "$fileType"
-            - Source App: "$sourceApp"
-            - Size: ${fileSizeLong / 1024} KB
-            
-            $rulePrompt
-            
-            Available Standard Categories: "Memes", "Work", "Personal", "Finance", "Recordings", "Screenshots", "Documents"
-            Choose the most logical category from the list, or create a specific new 1-word category (capitalized) if absolutely required.
-            
-            Return a JSON object with this exact structure:
-            {
-               "category": "Selected Category",
-               "tags": ["tag1", "tag2", "tag3"],
-               "explanation": "Brief 1-sentence explanation of why it was assigned here"
-            }
-            Do not include any markdown formatting (like ```json), just return raw JSON text.
-        """.trimIndent()
+        val granularityPrompt = when(granularity) {
+            "NARRATIVE" -> "Please generate creative, contextual narrative tags that describe actions, textures, vibes, moods, and broader context rather than simple dry labels."
+            "TECHNICAL" -> "Please generate technical tags describing dominant colors, lighting setup, framing/composition, estimated file specs, and other technical metadata descriptors."
+            else -> "Please generate highly relevant, concise standard descriptive tags based on file properties."
+        }
+
+        val base64Data = if (context != null && !localUri.isNullOrEmpty() && fileType == "IMAGE") {
+            getBase64FromUri(context, localUri)
+        } else {
+            null
+        }
+
+        val prompt = if (base64Data != null) {
+            """
+                You are a system file organizer. Analyze the visual content of this uploaded image and categorize it, supply highly specific descriptive tags based on what you actually see in the image, and write a 1-sentence analytical description of its visual content.
+                
+                Tagging Directive:
+                $granularityPrompt
+                
+                File Details:
+                - Name: "$fileName"
+                - Type: "$fileType"
+                - Source App: "$sourceApp"
+                - Size: ${fileSizeLong / 1024} KB
+                
+                $rulePrompt
+                
+                Available Standard Categories: "Memes", "Work", "Personal", "Finance", "Recordings", "Screenshots", "Documents"
+                Choose the most logical category from the list, or create a specific new 1-word category (capitalized) if absolutely required.
+                
+                Return a JSON object with this exact structure:
+                {
+                   "category": "Selected Category",
+                   "tags": ["tag1", "tag2", "tag3"],
+                   "explanation": "Brief 1-sentence description of what you see and why it was assigned here"
+                }
+                Do not include any markdown formatting (like ```json), just return raw JSON text.
+            """.trimIndent()
+        } else {
+            """
+                You are a system file organizer. Categorize this media file and supply tags and a 1-sentence analytical description.
+                
+                Taging Directive:
+                $granularityPrompt
+                
+                File Details:
+                - Name: "$fileName"
+                - Type: "$fileType"
+                - Source App: "$sourceApp"
+                - Size: ${fileSizeLong / 1024} KB
+                
+                $rulePrompt
+                
+                Available Standard Categories: "Memes", "Work", "Personal", "Finance", "Recordings", "Screenshots", "Documents"
+                Choose the most logical category from the list, or create a specific new 1-word category (capitalized) if absolutely required.
+                
+                Return a JSON object with this exact structure:
+                {
+                   "category": "Selected Category",
+                   "tags": ["tag1", "tag2", "tag3"],
+                   "explanation": "Brief 1-sentence explanation of why it was assigned here"
+                }
+                Do not include any markdown formatting (like ```json), just return raw JSON text.
+            """.trimIndent()
+        }
 
         try {
             val requestBodyJson = JSONObject().apply {
@@ -81,6 +159,14 @@ object GeminiClient {
                             put(JSONObject().apply {
                                 put("text", prompt)
                             })
+                            if (base64Data != null) {
+                                put(JSONObject().apply {
+                                    put("inlineData", JSONObject().apply {
+                                        put("mimeType", base64Data.second)
+                                        put("data", base64Data.first)
+                                    })
+                                })
+                            }
                         })
                     })
                 }

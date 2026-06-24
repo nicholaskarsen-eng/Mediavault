@@ -8,6 +8,9 @@ interface MediaFileDao {
     @Query("SELECT * FROM media_files ORDER BY timestamp DESC")
     fun getAllMediaFiles(): Flow<List<MediaFile>>
 
+    @Query("SELECT * FROM media_files")
+    suspend fun getAllMediaFilesDirect(): List<MediaFile>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMediaFile(mediaFile: MediaFile): Long
 
