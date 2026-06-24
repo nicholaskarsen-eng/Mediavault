@@ -69,12 +69,11 @@ object GeminiClient {
         fileType: String,
         sourceApp: String,
         fileSizeLong: Long,
-        localUri: String? = null,
         customRule: String? = null,
-        granularity: String? = null
+        modelName: String = MODEL_NAME,
+        apiKey: String
     ): AIOrganizationResult = withContext(Dispatchers.IO) {
-        val apiKey = BuildConfig.GEMINI_API_KEY
-        if (apiKey.isEmpty() || apiKey == "MY_GEMINI_API_KEY") {
+        if (apiKey.isBlank() || apiKey == "MY_GEMINI_API_KEY" || apiKey.contains("REPLACE_WITH_YOUR_GEMINI_API_KEY")) {
             Log.w(TAG, "Gemini API key is placeholder or empty. Using offline rules.")
             return@withContext runFallbackRules(fileName, fileType, sourceApp)
         }
@@ -179,7 +178,7 @@ object GeminiClient {
             }
 
             val request = Request.Builder()
-                .url("$BASE_URL/v1beta/models/$MODEL_NAME:generateContent?key=$apiKey")
+                .url("$BASE_URL/v1beta/models/$modelName:generateContent?key=$apiKey")
                 .post(requestBodyJson.toString().toRequestBody(mediaType))
                 .build()
 

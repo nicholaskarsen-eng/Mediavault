@@ -13,10 +13,17 @@ data class MediaFile(
     val timestamp: Long, // milliseconds
     val category: String = "Uncategorized", // "Memes", "Finance", "Personal", "Work", etc.
     val tags: String = "", // comma-separated strings
-    val syncStatus: String = "PENDING", // "PENDING", "SYNCED", "FAILED"
-    val cloudUrl: String? = null,
+    val syncStatus: String = "PENDING", // Overall status: "PENDING", "PARTIAL", "SYNCED"
+    val primaryUrl: String? = null,
+    val backupUrl: String? = null,
+    val archiveUrl: String? = null,
+    val disasterRecoveryUrl: String? = null,
+    val primarySyncStatus: String = "PENDING",
+    val backupSyncStatus: String = "PENDING",
+    val archiveSyncStatus: String = "PENDING",
+    val disasterRecoverySyncStatus: String = "PENDING",
     val aiSummary: String? = null,
-    val localUri: String? = null,
-    val md5Hash: String? = null,
-    val isDuplicate: Boolean = false
-)
+    val localUri: String? = null
+) {
+    val cloudUrl: String? get() = primaryUrl ?: backupUrl ?: archiveUrl ?: disasterRecoveryUrl
+}

@@ -10,22 +10,29 @@ import com.example.data.database.AppDatabase
 import com.example.data.database.MediaFile
 import com.example.data.repository.MediaRepository
 import com.example.data.api.GeminiClient
-import androidx.work.PeriodicWorkRequestBuilder
-import androidx.work.OneTimeWorkRequestBuilder
-import androidx.work.WorkManager
-import androidx.work.ExistingPeriodicWorkPolicy
-import androidx.work.ExistingWorkPolicy
-import androidx.work.Constraints
-import com.example.data.sync.SyncWorker
-import com.example.data.sync.DuplicateWorker
-import java.util.concurrent.TimeUnit
+import com.example.data.settings.SettingsManager
+import android.provider.MediaStore
+import android.content.ContentUris
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import java.util.UUID
+import java.util.Locale
+
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+data class CloudAccount(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val provider: String,
+    val accountName: String,
+    val region: String,
+    val type: String // "Primary", "Backup", "Archive", "DR"
+)
 
 data class TaggingEvent(
     val id: String = UUID.randomUUID().toString(),
@@ -39,50 +46,18 @@ data class TaggingEvent(
 class MediaViewModel(application: Application) : AndroidViewModel(application) {
     private val database = AppDatabase.getDatabase(application)
     private val repository = MediaRepository(database.mediaFileDao())
+    private val settingsManager = SettingsManager(application)
 
     private val _mediaFiles = MutableStateFlow<List<MediaFile>>(emptyList())
     val mediaFiles: StateFlow<List<MediaFile>> = _mediaFiles.asStateFlow()
 
-    private val _isAutoTaggingEnabled = MutableStateFlow(true)
-    val isAutoTaggingEnabled: StateFlow<Boolean> = _isAutoTaggingEnabled.asStateFlow()
-
-    private val _taggingGranularity = MutableStateFlow("STANDARD")
-    val taggingGranularity: StateFlow<String> = _taggingGranularity.asStateFlow()
-
-    private val _recentTaggingEvents = MutableStateFlow<List<TaggingEvent>>(listOf(
-        TaggingEvent(
-            fileName = "system_init.cfg",
-            status = "SUCCESS",
-            tags = listOf("system", "configuration", "initialization"),
-            description = "Preloaded system indices analyzed and cataloged successfully."
+    private val _connectedAccounts = MutableStateFlow<List<CloudAccount>>(
+        listOf(
+            CloudAccount(provider = "AWS S3", accountName = "primary-vault-prod", region = "us-east-1", type = "Primary"),
+            CloudAccount(provider = "Azure Blob", accountName = "backup-node-01", region = "westeurope", type = "Backup")
         )
-    ))
-    val recentTaggingEvents: StateFlow<List<TaggingEvent>> = _recentTaggingEvents.asStateFlow()
-
-    fun setAutoTaggingEnabled(enabled: Boolean) {
-        _isAutoTaggingEnabled.value = enabled
-        addAiLog("[AI Service] Auto-tagging state updated: " + if (enabled) "ENABLED" else "DISABLED")
-    }
-
-    fun setTaggingGranularity(granularity: String) {
-        _taggingGranularity.value = granularity
-        addAiLog("[AI Service] Tagging model directive updated: $granularity")
-    }
-
-    fun recordTaggingEvent(event: TaggingEvent) {
-        _recentTaggingEvents.value = (listOf(event) + _recentTaggingEvents.value).take(10)
-    }
-
-    private val _isLoading = MutableStateFlow(true)
-    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
-
-    fun refreshMedia() {
-        viewModelScope.launch {
-            _isLoading.value = true
-            delay(1500) // Beautiful simulated repository fetch delay
-            _isLoading.value = false
-        }
-    }
+    )
+    val connectedAccounts: StateFlow<List<CloudAccount>> = _connectedAccounts.asStateFlow()
 
     private val _selectedTab = MutableStateFlow(0)
     val selectedTab: StateFlow<Int> = _selectedTab.asStateFlow()
@@ -171,134 +146,67 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
     )
     val aiLogs: StateFlow<List<String>> = _aiLogs.asStateFlow()
 
-    private val _customRule = MutableStateFlow("")
+    // Import state
+    private val _isImporting = MutableStateFlow(false)
+    val isImporting: StateFlow<Boolean> = _isImporting.asStateFlow()
+
+    private val _importProgress = MutableStateFlow(0f)
+    val importProgress: StateFlow<Float> = _importProgress.asStateFlow()
+
+    private val _customRule = MutableStateFlow(settingsManager.getString(SettingsManager.KEY_CUSTOM_RULE, ""))
     val customRule: StateFlow<String> = _customRule.asStateFlow()
 
-    // Undo deletion tracking
-    private val _lastDeletedFiles = MutableStateFlow<List<MediaFile>>(emptyList())
-    val lastDeletedFiles: StateFlow<List<MediaFile>> = _lastDeletedFiles.asStateFlow()
+    private val _apiKey = MutableStateFlow(settingsManager.getString(SettingsManager.KEY_API_KEY, BuildConfig.GEMINI_API_KEY))
+    val apiKey: StateFlow<String> = _apiKey.asStateFlow()
 
-    private val _showUndoToast = MutableStateFlow(false)
-    val showUndoToast: StateFlow<Boolean> = _showUndoToast.asStateFlow()
+    // Fully comprehensive settings state
+    private val _isWifiOnlySync = MutableStateFlow(settingsManager.getBoolean(SettingsManager.KEY_WIFI_ONLY, true))
+    val isWifiOnlySync: StateFlow<Boolean> = _isWifiOnlySync.asStateFlow()
 
-    fun dismissUndoToast() {
-        _showUndoToast.value = false
-        _lastDeletedFiles.value = emptyList()
-    }
+    private val _isBiometricEnabled = MutableStateFlow(settingsManager.getBoolean(SettingsManager.KEY_BIOMETRIC, false))
+    val isBiometricEnabled: StateFlow<Boolean> = _isBiometricEnabled.asStateFlow()
 
-    fun undoDelete() {
-        viewModelScope.launch {
-            val filesToRestore = _lastDeletedFiles.value
-            _lastDeletedFiles.value = emptyList()
-            _showUndoToast.value = false
-            filesToRestore.forEach { file ->
-                val restoredFile = file.copy(id = 0)
-                repository.insert(restoredFile)
-            }
-            addSyncLog("[System] Restored ${filesToRestore.size} files from undo action")
-        }
-    }
+    private val _appTheme = MutableStateFlow(settingsManager.getString(SettingsManager.KEY_THEME, "System")) // "Light", "Dark", "System"
+    val appTheme: StateFlow<String> = _appTheme.asStateFlow()
 
-    // Secure uploads tracking
-    private val _activeUploads = MutableStateFlow<List<UploadTask>>(emptyList())
-    val activeUploads: StateFlow<List<UploadTask>> = _activeUploads.asStateFlow()
+    private val _autoOrganizeOnImport = MutableStateFlow(settingsManager.getBoolean(SettingsManager.KEY_AUTO_ORGANIZE, true))
+    val autoOrganizeOnImport: StateFlow<Boolean> = _autoOrganizeOnImport.asStateFlow()
 
-    fun removeActiveUpload(id: String) {
-        _activeUploads.value = _activeUploads.value.filter { it.id != id }
-    }
+    private val _notificationsEnabled = MutableStateFlow(settingsManager.getBoolean(SettingsManager.KEY_NOTIFICATIONS, true))
+    val notificationsEnabled: StateFlow<Boolean> = _notificationsEnabled.asStateFlow()
 
-    // Cloud accounts state
-    private val _googleDriveEmail = MutableStateFlow<String?>(null)
-    val googleDriveEmail: StateFlow<String?> = _googleDriveEmail.asStateFlow()
+    private val _isCloudSyncEnabled = MutableStateFlow(settingsManager.getBoolean(SettingsManager.KEY_CLOUD_SYNC, false))
+    val isCloudSyncEnabled: StateFlow<Boolean> = _isCloudSyncEnabled.asStateFlow()
 
-    private val _googleDriveFolder = MutableStateFlow<String>("CipherVault_Backup")
-    val googleDriveFolder: StateFlow<String> = _googleDriveFolder.asStateFlow()
+    private val _selectedAiModel = MutableStateFlow(settingsManager.getString(SettingsManager.KEY_AI_MODEL, "gemini-1.5-flash")) // "gemini-1.5-flash", "gemini-1.5-pro"
+    val selectedAiModel: StateFlow<String> = _selectedAiModel.asStateFlow()
 
-    private val _dropboxEmail = MutableStateFlow<String?>(null)
-    val dropboxEmail: StateFlow<String?> = _dropboxEmail.asStateFlow()
+    private val _maxVaultSizeMb = MutableStateFlow(settingsManager.getInt(SettingsManager.KEY_MAX_SIZE, 500))
+    val maxVaultSizeMb: StateFlow<Int> = _maxVaultSizeMb.asStateFlow()
 
-    private val _dropboxFolder = MutableStateFlow<String>("CipherVault_Sync")
-    val dropboxFolder: StateFlow<String> = _dropboxFolder.asStateFlow()
+    private val _autoDeleteAfterDays = MutableStateFlow(settingsManager.getInt(SettingsManager.KEY_AUTO_DELETE, 0)) // 0 means disabled
+    val autoDeleteAfterDays: StateFlow<Int> = _autoDeleteAfterDays.asStateFlow()
 
-    private val _preferredCloudRepository = MutableStateFlow<String>("None") // "None", "Google Drive", "Dropbox"
-    val preferredCloudRepository: StateFlow<String> = _preferredCloudRepository.asStateFlow()
+    private val _isUniversalRepoEnabled = MutableStateFlow(settingsManager.getBoolean(SettingsManager.KEY_UNIVERSAL_REPO, false))
+    val isUniversalRepoEnabled: StateFlow<Boolean> = _isUniversalRepoEnabled.asStateFlow()
 
-    fun linkGoogleDrive(email: String, folder: String) {
-        _googleDriveEmail.value = email.trim()
-        _googleDriveFolder.value = folder.ifBlank { "CipherVault_Backup" }.trim()
-        _preferredCloudRepository.value = "Google Drive"
-        addSyncLog("[System] Linked Google Drive Account: $email to directory: ${_googleDriveFolder.value}")
-        addSyncLog("[System] Configured Google Drive as primary Cloud backing store.")
-    }
+    private val _autoConsolidate = MutableStateFlow(true)
+    val autoConsolidate: StateFlow<Boolean> = _autoConsolidate.asStateFlow()
 
-    fun disconnectGoogleDrive() {
-        val oldEmail = _googleDriveEmail.value
-        _googleDriveEmail.value = null
-        if (_preferredCloudRepository.value == "Google Drive") {
-            _preferredCloudRepository.value = if (_dropboxEmail.value != null) "Dropbox" else "None"
-        }
-        addSyncLog("[System] Disconnected Google Drive Account ($oldEmail). Storage configurations reset.")
-    }
+    private val _deviceId = MutableStateFlow(settingsManager.getString(SettingsManager.KEY_DEVICE_ID, "DEV-${java.util.UUID.randomUUID().toString().take(6).uppercase()}"))
+    val deviceId: StateFlow<String> = _deviceId.asStateFlow()
 
-    fun linkDropbox(email: String, folder: String) {
-        _dropboxEmail.value = email.trim()
-        _dropboxFolder.value = folder.ifBlank { "CipherVault_Sync" }.trim()
-        _preferredCloudRepository.value = "Dropbox"
-        addSyncLog("[System] Linked Dropbox Account: $email to directory: ${_dropboxFolder.value}")
-        addSyncLog("[System] Configured Dropbox as primary Cloud backing store.")
-    }
+    private val _redundancyLevel = MutableStateFlow(settingsManager.getInt(SettingsManager.KEY_REDUNDANCY, 4)) // 1 to 4 nodes
+    val redundancyLevel: StateFlow<Int> = _redundancyLevel.asStateFlow()
 
-    fun disconnectDropbox() {
-        val oldEmail = _dropboxEmail.value
-        _dropboxEmail.value = null
-        if (_preferredCloudRepository.value == "Dropbox") {
-            _preferredCloudRepository.value = if (_googleDriveEmail.value != null) "Google Drive" else "None"
-        }
-        addSyncLog("[System] Disconnected Dropbox Account ($oldEmail). Storage configurations reset.")
-    }
-
-    fun setPreferredCloudRepository(provider: String) {
-        _preferredCloudRepository.value = provider
-        addSyncLog("[System] Root database backup sync node shifted to: $provider")
-    }
-
-    // Duplicate Management State
-    private val _isScanningDuplicates = MutableStateFlow(false)
-    val isScanningDuplicates: StateFlow<Boolean> = _isScanningDuplicates.asStateFlow()
-
-    fun scanForDuplicates() {
-        val workManager = WorkManager.getInstance(getApplication())
-        val duplicateRequest = OneTimeWorkRequestBuilder<DuplicateWorker>()
-            .addTag("DuplicateScannerJob")
-            .build()
-            
-        _isScanningDuplicates.value = true
-        addSyncLog("[System] MD5 Engine: Calculating file checksum signatures & scanning vault...")
-        
-        workManager.enqueueUniqueWork(
-            "DuplicateScannerJob",
-            ExistingWorkPolicy.REPLACE,
-            duplicateRequest
-        )
-        
-        viewModelScope.launch {
-            delay(2000) // Visual execution delay
-            _isScanningDuplicates.value = false
-            addSyncLog("[System] MD5 Engine: Vault analysis complete. Parallel duplicates identified and flagged.")
-        }
-    }
-
-    fun keepDuplicateFile(file: MediaFile) {
-        viewModelScope.launch {
-            val updatedFile = file.copy(isDuplicate = false)
-            repository.update(updatedFile)
-            addSyncLog("[System] MD5 Engine: Excluded \"${file.fileName}\" from duplicate group per user feedback.")
-        }
-    }
+    private val _lastSyncTimestamp = MutableStateFlow<Long?>(null)
+    val lastSyncTimestamp: StateFlow<Long?> = _lastSyncTimestamp.asStateFlow()
 
     // Key warning state description
     val isApiKeyConfigured: Boolean
-        get() = BuildConfig.GEMINI_API_KEY.isNotEmpty() && BuildConfig.GEMINI_API_KEY != "MY_GEMINI_API_KEY"
+        get() = _apiKey.value.isNotBlank() && 
+                _apiKey.value != "MY_GEMINI_API_KEY" &&
+                !_apiKey.value.contains("REPLACE_WITH_YOUR_GEMINI_API_KEY")
 
     init {
         // Trigger initial simulated repository fetching delay
@@ -308,10 +216,6 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repository.allMediaFiles.collectLatest { list ->
                 _mediaFiles.value = list
-                // Pre-populate if database is empty so we have interactive content on fresh launch
-                if (list.isEmpty()) {
-                    prepopulateDatabase()
-                }
             }
         }
     }
@@ -322,179 +226,138 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateCustomRule(rule: String) {
         _customRule.value = rule
+        settingsManager.setString(SettingsManager.KEY_CUSTOM_RULE, rule)
+        autoSyncConfigIfEnabled()
     }
 
-    private suspend fun prepopulateDatabase() {
-        val initialFiles = listOf(
-            MediaFile(
-                fileName = "invoice_tax_quarter2.pdf",
-                fileType = "DOCUMENT",
-                sourceApp = "Telegram",
-                fileSize = 1048576 * 2, // 2MB
-                timestamp = System.currentTimeMillis() - 86400000 * 2, // 2 days ago
-                category = "Uncategorized",
-                syncStatus = "PENDING"
-            ),
-            MediaFile(
-                fileName = "laughing_cat_haha.mp4",
-                fileType = "VIDEO",
-                sourceApp = "WhatsApp",
-                fileSize = 1048576 * 12, // 12MB
-                timestamp = System.currentTimeMillis() - 3600000 * 4, // 4 hours ago
-                category = "Uncategorized",
-                syncStatus = "PENDING"
-            ),
-            MediaFile(
-                fileName = "screenshot_2026_06_22.png",
-                fileType = "IMAGE",
-                sourceApp = "Screenshots",
-                fileSize = 1048576 / 2, // 500KB
-                timestamp = System.currentTimeMillis() - 1800000, // 30 mins ago
-                category = "Uncategorized",
-                syncStatus = "PENDING"
-            ),
-            MediaFile(
-                fileName = "meeting_audio_memo.wav",
-                fileType = "AUDIO",
-                sourceApp = "Downloads",
-                fileSize = 1048576 * 15, // 15MB
-                timestamp = System.currentTimeMillis() - 86400000, // 1 day ago
-                category = "Uncategorized",
-                syncStatus = "PENDING"
-            ),
-            MediaFile(
-                fileName = "personal_holiday_trip_sunset.jpg",
-                fileType = "IMAGE",
-                sourceApp = "Camera",
-                fileSize = 1048576 * 4, // 4MB
-                timestamp = System.currentTimeMillis() - 86400000 * 5, // 5 days ago
-                category = "Personal",
-                syncStatus = "SYNCED",
-                cloudUrl = "https://omni-vault.s3.us-west-2.amazonaws.com/u/sunset_8291.jpg",
-                aiSummary = "Analyzed by local agent: Dynamic scenic sunset landscape containing highly structured warm elements."
-            )
-        )
-        initialFiles.forEach { repository.insert(it) }
+    fun updateApiKey(key: String) {
+        _apiKey.value = key
+        settingsManager.setString(SettingsManager.KEY_API_KEY, key)
+        autoSyncConfigIfEnabled()
     }
 
-    fun addSimulatedFile(fileName: String, fileType: String, sourceApp: String, fileSizeMb: Double) {
+    fun updateWifiOnlySync(enabled: Boolean) {
+        _isWifiOnlySync.value = enabled
+        settingsManager.setBoolean(SettingsManager.KEY_WIFI_ONLY, enabled)
+        autoSyncConfigIfEnabled()
+    }
+
+    fun updateBiometricEnabled(enabled: Boolean) {
+        _isBiometricEnabled.value = enabled
+        settingsManager.setBoolean(SettingsManager.KEY_BIOMETRIC, enabled)
+        autoSyncConfigIfEnabled()
+    }
+
+    fun updateAppTheme(theme: String) {
+        _appTheme.value = theme
+        settingsManager.setString(SettingsManager.KEY_THEME, theme)
+        autoSyncConfigIfEnabled()
+    }
+
+    fun updateAutoOrganizeOnImport(enabled: Boolean) {
+        _autoOrganizeOnImport.value = enabled
+        settingsManager.setBoolean(SettingsManager.KEY_AUTO_ORGANIZE, enabled)
+        autoSyncConfigIfEnabled()
+    }
+
+    fun updateNotificationsEnabled(enabled: Boolean) {
+        _notificationsEnabled.value = enabled
+        settingsManager.setBoolean(SettingsManager.KEY_NOTIFICATIONS, enabled)
+        autoSyncConfigIfEnabled()
+    }
+
+    fun updateSelectedAiModel(model: String) {
+        _selectedAiModel.value = model
+        settingsManager.setString(SettingsManager.KEY_AI_MODEL, model)
+        addAiLog("[System] AI Engine switched to: $model")
+        autoSyncConfigIfEnabled()
+    }
+
+    fun updateMaxVaultSize(size: Int) {
+        _maxVaultSizeMb.value = size
+        settingsManager.setInt(SettingsManager.KEY_MAX_SIZE, size)
+        autoSyncConfigIfEnabled()
+    }
+
+    fun updateAutoDeleteAfterDays(days: Int) {
+        _autoDeleteAfterDays.value = days
+        settingsManager.setInt(SettingsManager.KEY_AUTO_DELETE, days)
+        autoSyncConfigIfEnabled()
+    }
+
+    fun updateUniversalRepoEnabled(enabled: Boolean) {
+        _isUniversalRepoEnabled.value = enabled
+        settingsManager.setBoolean(SettingsManager.KEY_UNIVERSAL_REPO, enabled)
+        if (enabled) {
+            addSyncLog("[System] Universal Repository Protocol: ACTIVATED. Cross-device consolidation enabled.")
+            autoSyncConfigIfEnabled()
+        } else {
+            addSyncLog("[System] Universal Repository Protocol: DEACTIVATED. Device isolation enforced.")
+        }
+    }
+
+    fun updateRedundancyLevel(level: Int) {
+        val maxNodes = _connectedAccounts.value.size.coerceAtLeast(1)
+        val coercedLevel = level.coerceIn(1, maxNodes)
+        _redundancyLevel.value = coercedLevel
+        settingsManager.setInt(SettingsManager.KEY_REDUNDANCY, coercedLevel)
+        addSyncLog("[System] Sync Redundancy re-configured to: $coercedLevel-Node Matrix.")
+        autoSyncConfigIfEnabled()
+    }
+
+    private fun autoSyncConfigIfEnabled() {
+        if (_isUniversalRepoEnabled.value && _isCloudSyncEnabled.value) {
+            syncConfigurationToCloud()
+        }
+    }
+
+    fun syncConfigurationToCloud() {
         viewModelScope.launch {
-            val sizeBytes = (fileSizeMb * 1024 * 1024).toLong()
-            val taskId = UUID.randomUUID().toString()
-            val task = UploadTask(
-                id = taskId,
-                fileName = fileName,
-                totalSize = sizeBytes,
-                progress = 0.1f,
-                status = "ENCRYPTING"
-            )
-            _activeUploads.value = _activeUploads.value + task
-            
-            // 1. Simulate encryption stage
-            delay(1000)
-            _activeUploads.value = _activeUploads.value.map {
-                if (it.id == taskId) it.copy(progress = 0.3f, status = "UPLOADING") else it
-            }
-            
-            // 2. Simulate uploading to sandbox vault
-            delay(1200)
-            _activeUploads.value = _activeUploads.value.map {
-                if (it.id == taskId) it.copy(progress = 0.7f, status = "ANALYZING_AI") else it
-            }
+            addSyncLog("[Sync Engine] Mirroring system configuration to Global Matrix...")
+            delay(500)
+            // Simulated upload of settings to cloud metadata
+            addSyncLog("[Sync Engine] Configuration mirroring SUCCESSFUL. All nodes updated.")
+        }
+    }
 
-            val file = MediaFile(
-                fileName = fileName,
-                fileType = fileType,
-                sourceApp = sourceApp,
-                fileSize = sizeBytes,
-                timestamp = System.currentTimeMillis(),
-                category = "Uncategorized",
-                syncStatus = "PENDING"
-            )
-            val generatedId = repository.insert(file)
-            val insertedFile = file.copy(id = generatedId.toInt())
-            addSyncLog("[System] New inbound file repository registration: $fileName from $sourceApp")
-            
-            val result = if (_isAutoTaggingEnabled.value) {
-                addAiLog("[AI] Automatically organizing newly uploaded file: \"$fileName\"...")
-                val res = GeminiClient.organizeFile(
-                    context = getApplication(),
-                    fileName = insertedFile.fileName,
-                    fileType = insertedFile.fileType,
-                    sourceApp = insertedFile.sourceApp,
-                    fileSizeLong = insertedFile.fileSize,
-                    localUri = null,
-                    customRule = _customRule.value,
-                    granularity = _taggingGranularity.value
-                )
-                val statusStr = if (isApiKeyConfigured) "SUCCESS" else "OFFLINE_FALLBACK"
-                recordTaggingEvent(
-                    TaggingEvent(
-                        fileName = fileName,
-                        status = statusStr,
-                        tags = res.tags,
-                        description = "Simulated upload processed: ${res.explanation}"
-                    )
-                )
-                res
-            } else {
-                addAiLog("[AI] Auto-tagging bypassed for \"$fileName\" per user preference.")
-                recordTaggingEvent(
-                    TaggingEvent(
-                        fileName = fileName,
-                        status = "BYPASSED",
-                        tags = emptyList(),
-                        description = "Auto-tagging was deactivated by the user. Real-time Gemini analysis skipped."
-                    )
-                )
-                com.example.data.api.AIOrganizationResult(
-                    category = "Uncategorized",
-                    tags = emptyList(),
-                    explanation = "Awaiting manual tag generation. Real-time auto-tagger client was bypassed."
-                )
-            }
+    fun autoConfigureRedundancyFromAccounts() {
+        val count = _connectedAccounts.value.size.coerceIn(1, 4)
+        _redundancyLevel.value = count
+        addSyncLog("[System] Auto-configured Redundancy Level to $count based on ${_connectedAccounts.value.size} linked cloud accounts.")
+    }
 
-            val updatedFile = insertedFile.copy(
-                category = result.category,
-                tags = result.tags.joinToString(", "),
-                aiSummary = result.explanation
-            )
-            repository.update(updatedFile)
-            if (_isAutoTaggingEnabled.value) {
-                addAiLog("[AI] Automatically organized \"$fileName\" into [${result.category}] tags: ${result.tags.joinToString(", ")}")
-            }
+    fun linkAccount(provider: String, name: String, region: String, type: String) {
+        val newAccount = CloudAccount(provider = provider, accountName = name, region = region, type = type)
+        _connectedAccounts.value = _connectedAccounts.value + newAccount
+        addSyncLog("[System] New cloud account linked: $name ($provider)")
+    }
 
-            // Mark task as completed
-            _activeUploads.value = _activeUploads.value.map {
-                if (it.id == taskId) it.copy(progress = 1.0f, status = "COMPLETED", tags = result.tags) else it
-            }
+    fun unlinkAccount(id: String) {
+        val account = _connectedAccounts.value.find { it.id == id }
+        _connectedAccounts.value = _connectedAccounts.value.filter { it.id != id }
+        account?.let { addSyncLog("[System] Cloud account removed: ${it.accountName}") }
+        
+        // Ensure redundancy level does not exceed the new account count
+        val maxNodes = _connectedAccounts.value.size.coerceAtLeast(1)
+        if (_redundancyLevel.value > maxNodes) {
+            _redundancyLevel.value = maxNodes
+            addSyncLog("[System] Sync Redundancy auto-adjusted to $maxNodes nodes due to account removal.")
+        }
+    }
+
+    fun updateCloudSyncEnabled(enabled: Boolean) {
+        _isCloudSyncEnabled.value = enabled
+        if (enabled) {
+            addSyncLog("[System] Cloud Synchronization Gate: OPENED.")
+        } else {
+            addSyncLog("[System] Cloud Synchronization Gate: CLOSED. Data restricted to local sandbox.")
         }
     }
 
     fun addImportedFile(fileName: String, fileType: String, sourceApp: String, sizeBytes: Long, uri: String) {
         viewModelScope.launch {
-            val taskId = UUID.randomUUID().toString()
-            val task = UploadTask(
-                id = taskId,
-                fileName = fileName,
-                totalSize = sizeBytes,
-                progress = 0.1f,
-                status = "ENCRYPTING"
-            )
-            _activeUploads.value = _activeUploads.value + task
-            
-            // 1. Simulate encryption stage
-            delay(1000)
-            _activeUploads.value = _activeUploads.value.map {
-                if (it.id == taskId) it.copy(progress = 0.3f, status = "UPLOADING") else it
-            }
-            
-            // 2. Simulate saving to secure sandbox vault
-            delay(1200)
-            _activeUploads.value = _activeUploads.value.map {
-                if (it.id == taskId) it.copy(progress = 0.7f, status = "ANALYZING_AI") else it
-            }
-
+            _isImporting.value = true
+            _importProgress.value = 0.5f
             val file = MediaFile(
                 fileName = fileName,
                 fileType = fileType,
@@ -507,60 +370,30 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
             )
             val generatedId = repository.insert(file)
             val insertedFile = file.copy(id = generatedId.toInt())
+            _importProgress.value = 1f
             addSyncLog("[System] Imported physical device file: $fileName under Secure Sandbox")
+            delay(500)
+            _isImporting.value = false
             
-            val result = if (_isAutoTaggingEnabled.value) {
+            // Automatically analyze and generate descriptive tags upon upload if enabled
+            if (_autoOrganizeOnImport.value) {
                 addAiLog("[AI] Automatically organizing newly imported file: \"$fileName\"...")
-                val res = GeminiClient.organizeFile(
-                    context = getApplication(),
+                val result = GeminiClient.organizeFile(
                     fileName = insertedFile.fileName,
                     fileType = insertedFile.fileType,
                     sourceApp = insertedFile.sourceApp,
                     fileSizeLong = insertedFile.fileSize,
-                    localUri = insertedFile.localUri,
                     customRule = _customRule.value,
-                    granularity = _taggingGranularity.value
+                    modelName = _selectedAiModel.value,
+                    apiKey = _apiKey.value
                 )
-                val statusStr = if (isApiKeyConfigured) "SUCCESS" else "OFFLINE_FALLBACK"
-                recordTaggingEvent(
-                    TaggingEvent(
-                        fileName = fileName,
-                        status = statusStr,
-                        tags = res.tags,
-                        description = "Imported file processed: ${res.explanation}"
-                    )
+                val updatedFile = insertedFile.copy(
+                    category = result.category,
+                    tags = result.tags.joinToString(", "),
+                    aiSummary = result.explanation
                 )
-                res
-            } else {
-                addAiLog("[AI] Auto-tagging bypassed for \"$fileName\" per user preference.")
-                recordTaggingEvent(
-                    TaggingEvent(
-                        fileName = fileName,
-                        status = "BYPASSED",
-                        tags = emptyList(),
-                        description = "Auto-tagging was deactivated by the user. Real-time Gemini analysis skipped."
-                    )
-                )
-                com.example.data.api.AIOrganizationResult(
-                    category = "Uncategorized",
-                    tags = emptyList(),
-                    explanation = "Awaiting manual tag generation. Real-time auto-tagger client was bypassed."
-                )
-            }
-
-            val updatedFile = insertedFile.copy(
-                category = result.category,
-                tags = result.tags.joinToString(", "),
-                aiSummary = result.explanation
-            )
-            repository.update(updatedFile)
-            if (_isAutoTaggingEnabled.value) {
+                repository.update(updatedFile)
                 addAiLog("[AI] Automatically organized \"$fileName\" into [${result.category}] tags: ${result.tags.joinToString(", ")}")
-            }
-
-            // Mark task as completed
-            _activeUploads.value = _activeUploads.value.map {
-                if (it.id == taskId) it.copy(progress = 1.0f, status = "COMPLETED", tags = result.tags) else it
             }
         }
     }
@@ -617,7 +450,6 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repository.clearAll()
             _syncLogs.value = listOf("[System] Vault registers cleared.", "[System] Database index reset.")
-            prepopulateDatabase()
         }
     }
 
@@ -639,9 +471,9 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
                 fileType = file.fileType,
                 sourceApp = file.sourceApp,
                 fileSizeLong = file.fileSize,
-                localUri = file.localUri,
                 customRule = _customRule.value,
-                granularity = _taggingGranularity.value
+                modelName = _selectedAiModel.value,
+                apiKey = _apiKey.value
             )
 
             val updatedFile = file.copy(
@@ -663,7 +495,7 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // Trigger organization for all files currently marked "Uncategorized"
+    // Trigger organization for all files currently marked "Uncategorized" with parallel execution
     fun autoOrganizeAll() {
         val filesToOrganize = _mediaFiles.value.filter { it.category == "Uncategorized" }
         if (filesToOrganize.isEmpty()) {
@@ -673,102 +505,313 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch {
             _isOrganizing.value = true
-            addAiLog("[AI] Commencing folder scan. Found ${filesToOrganize.size} files ready for organization.")
+            addAiLog("[AI] Commencing Parallel Agent cataloging. Found ${filesToOrganize.size} files for organization.")
             
-            for (file in filesToOrganize) {
-                addAiLog("[AI] Organizing \"${file.fileName}\"...")
-                val result = GeminiClient.organizeFile(
-                    context = getApplication(),
-                    fileName = file.fileName,
-                    fileType = file.fileType,
-                    sourceApp = file.sourceApp,
-                    fileSizeLong = file.fileSize,
-                    localUri = file.localUri,
-                    customRule = _customRule.value,
-                    granularity = _taggingGranularity.value
-                )
-
-                val updatedFile = file.copy(
-                    category = result.category,
-                    tags = result.tags.joinToString(", "),
-                    aiSummary = result.explanation
-                )
-                repository.update(updatedFile)
-                val statusStr = if (isApiKeyConfigured) "SUCCESS" else "OFFLINE_FALLBACK"
-                recordTaggingEvent(
-                    TaggingEvent(
+            val mutex = Mutex()
+            
+            // Process files in parallel to optimize deployment throughput
+            filesToOrganize.map { file ->
+                async {
+                    mutex.withLock {
+                        addAiLog("[AI] Analyzing \"${file.fileName}\" on background thread...")
+                    }
+                    
+                    val result = GeminiClient.organizeFile(
                         fileName = file.fileName,
-                        status = statusStr,
-                        tags = result.tags,
-                        description = "Batch catalog scan: ${result.explanation}"
+                        fileType = file.fileType,
+                        sourceApp = file.sourceApp,
+                        fileSizeLong = file.fileSize,
+                        customRule = _customRule.value,
+                        modelName = _selectedAiModel.value,
+                        apiKey = _apiKey.value
                     )
-                )
-                addAiLog("[AI] -> Complete: ${file.fileName} is in folder [${result.category}]")
-                delay(800) // Small delay to visualize progress nicely
-            }
+
+                    val updatedFile = file.copy(
+                        category = result.category,
+                        tags = result.tags.joinToString(", "),
+                        aiSummary = result.explanation
+                    )
+                    repository.update(updatedFile)
+                    
+                    mutex.withLock {
+                        addAiLog("[AI] -> Integrated: ${file.fileName} cataloged into [${result.category}]")
+                    }
+                    delay(300) // Reduced delay for parallel visualization
+                }
+            }.awaitAll()
+            
             _isOrganizing.value = false
-            addAiLog("[AI] Process finished! All files successfully integrated.")
+            addAiLog("[AI] Parallel Multi-Agent process finished! Vault consolidated.")
         }
     }
 
-    // Cloud syncing simulator
+    fun scanDeviceMedia() {
+        viewModelScope.launch {
+            _isImporting.value = true
+            _importProgress.value = 0f
+            addSyncLog("[System] Initializing Deep Scan of local device directories...")
+            
+            val context = getApplication<Application>().applicationContext
+            val contentResolver = context.contentResolver
+            
+            val mediaUris = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                listOf(
+                    MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL),
+                    MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL),
+                    MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+                )
+            } else {
+                listOf(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+                )
+            }
+            
+            val foundItems = mutableListOf<MediaFile>()
+            
+            mediaUris.forEach { uri ->
+                val projection = arrayOf(
+                    MediaStore.MediaColumns._ID,
+                    MediaStore.MediaColumns.DISPLAY_NAME,
+                    MediaStore.MediaColumns.SIZE,
+                    MediaStore.MediaColumns.MIME_TYPE,
+                    MediaStore.MediaColumns.DATE_ADDED,
+                    MediaStore.MediaColumns.DATA
+                )
+                
+                contentResolver.query(uri, projection, null, null, "${MediaStore.MediaColumns.DATE_ADDED} DESC")?.use { cursor ->
+                    val idIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                    val nameIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                    val sizeIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
+                    val mimeIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
+                    val dateIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_ADDED)
+                    val dataIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
+                    
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getLong(idIndex)
+                        val name = cursor.getString(nameIndex)
+                        val size = cursor.getLong(sizeIndex)
+                        val mime = cursor.getString(mimeIndex)
+                        val date = cursor.getLong(dateIndex) * 1000
+                        val path = cursor.getString(dataIndex)
+                        
+                        val type = when {
+                            mime.startsWith("image/") -> "IMAGE"
+                            mime.startsWith("video/") -> "VIDEO"
+                            mime.startsWith("audio/") -> "AUDIO"
+                            else -> "DOCUMENT"
+                        }
+                        
+                        val sourceApp = detectAppRegistry(path)
+                        val contentUri = ContentUris.withAppendedId(uri, id).toString()
+                        
+                        if (_mediaFiles.value.none { it.fileName == name }) {
+                            foundItems.add(MediaFile(
+                                fileName = name,
+                                fileType = type,
+                                sourceApp = sourceApp,
+                                fileSize = size,
+                                timestamp = date,
+                                category = "Uncategorized",
+                                syncStatus = "PENDING",
+                                localUri = contentUri
+                            ))
+                        }
+                    }
+                }
+            }
+            
+            var count = 0
+            val total = foundItems.size
+            if (total > 0) {
+                foundItems.forEachIndexed { index, file ->
+                    repository.insert(file)
+                    count++
+                    addSyncLog("[System] Discovered: ${file.fileName}")
+                    _importProgress.value = (index + 1).toFloat() / total
+                    delay(50) 
+                }
+            }
+            
+            _isImporting.value = false
+            if (count > 0) {
+                addAiLog("[AI] Scan complete. $count new files indexed. Triggering Organization...")
+                autoOrganizeAll()
+            } else {
+                addAiLog("[AI] Scan complete. No new files found.")
+            }
+        }
+    }
+
+    // Cloud syncing to multiple mirrors based on connected accounts
     fun syncNow() {
-        val pendingFiles = _mediaFiles.value.filter { it.syncStatus == "PENDING" }
+        val pendingFiles = _mediaFiles.value.filter { it.syncStatus != "SYNCED" }
         if (pendingFiles.isEmpty()) {
-            addSyncLog("[System] Sync checked: All repository indexes already secure on Cloud Node.")
+            addSyncLog("[System] Sync checked: All repository mirrors already secure.")
+            return
+        }
+
+        val accounts = _connectedAccounts.value
+        if (accounts.isEmpty()) {
+            addSyncLog("[Error] No cloud accounts linked. Cannot initiate mirror sync.")
             return
         }
 
         viewModelScope.launch {
             _isSyncing.value = true
             _syncProgress.value = 0f
-            val provider = _preferredCloudRepository.value
-            if (provider == "None") {
-                addSyncLog("[Sync Engine] Warning: No preferred cloud repository linked. Falling back to default backup sandbox container...")
-            } else {
-                val email = if (provider == "Google Drive") _googleDriveEmail.value else _dropboxEmail.value
-                val folder = if (provider == "Google Drive") _googleDriveFolder.value else _dropboxFolder.value
-                addSyncLog("[Sync Engine] Active backing store: $provider")
-                addSyncLog("[Sync Engine] Remote destination: account $email inside subfolder /$folder")
-            }
+            addSyncLog("[Sync Engine] Initializing Multi-Threaded Deployment Matrix for ${accounts.size} mirrors...")
             delay(1000)
-            addSyncLog("[Sync Engine] Connecting to target Master Cloud Sync Registry...")
-            delay(1000)
-            addSyncLog("[Sync Engine] Authenticating access credentials with end-to-end TLS 1.3 handshakes...")
-            delay(1000)
-            addSyncLog("[Sync Engine] Found ${pendingFiles.size} media items awaiting sync.")
 
-            val increment = 1f / pendingFiles.size
-            for ((index, file) in pendingFiles.withIndex()) {
-                addSyncLog("[Sync Engine] Sending metadata: \"${file.fileName}\" (${file.fileSize / 1024} KB)")
-                delay(600)
-                
-                // Simulate progressive upload chunks
-                val steps = 3
-                for (s in 1..steps) {
-                    val partOffset = ((index + (s.toFloat() / steps)) * increment).coerceAtLeast(0f)
-                    _syncProgress.value = partOffset
-                    delay(300)
+            val totalSteps = pendingFiles.size * accounts.size
+            var completedSteps = 0
+            val mutex = Mutex()
+
+            // Process all pending files in parallel
+            pendingFiles.map { file ->
+                async {
+                    var updatedFile = file
+                    
+                    // Sync to each connected account
+                    accounts.forEach { account ->
+                        // Simulate mirror-specific logic based on type
+                        val isAlreadySynced = when (account.type) {
+                            "Primary" -> updatedFile.primarySyncStatus == "SYNCED"
+                            "Backup" -> updatedFile.backupSyncStatus == "SYNCED"
+                            "Archive" -> updatedFile.archiveSyncStatus == "SYNCED"
+                            "DR" -> updatedFile.disasterRecoverySyncStatus == "SYNCED"
+                            else -> false
+                        }
+
+                        if (!isAlreadySynced) {
+                            delay(300) // Latency simulation
+                            
+                            val mirrorUrl = "https://${account.provider.lowercase().replace(" ", "-")}.io/u/${file.fileName}"
+                            
+                            updatedFile = when (account.type) {
+                                "Primary" -> updatedFile.copy(primarySyncStatus = "SYNCED", primaryUrl = mirrorUrl)
+                                "Backup" -> updatedFile.copy(backupSyncStatus = "SYNCED", backupUrl = mirrorUrl)
+                                "Archive" -> updatedFile.copy(archiveSyncStatus = "SYNCED", archiveUrl = mirrorUrl)
+                                "DR" -> updatedFile.copy(disasterRecoverySyncStatus = "SYNCED", disasterRecoveryUrl = mirrorUrl)
+                                else -> updatedFile
+                            }
+
+                            mutex.withLock {
+                                completedSteps++
+                                _syncProgress.value = completedSteps.toFloat() / totalSteps
+                                addSyncLog("[Sync Engine] Mirror ${account.provider} (${account.type}): Secured \"${file.fileName}\"")
+                            }
+                        }
+                    }
+
+                    // Calculate final status based on available accounts
+                    val requiredTypes = accounts.map { it.type }.toSet()
+                    val isPrimaryOk = !"Primary".isIn(requiredTypes) || updatedFile.primarySyncStatus == "SYNCED"
+                    val isBackupOk = !"Backup".isIn(requiredTypes) || updatedFile.backupSyncStatus == "SYNCED"
+                    val isArchiveOk = !"Archive".isIn(requiredTypes) || updatedFile.archiveSyncStatus == "SYNCED"
+                    val isDrOk = !"DR".isIn(requiredTypes) || updatedFile.disasterRecoverySyncStatus == "SYNCED"
+
+                    val finalStatus = if (isPrimaryOk && isBackupOk && isArchiveOk && isDrOk) "SYNCED" else "PARTIAL"
+                    repository.update(updatedFile.copy(syncStatus = finalStatus))
                 }
+            }.awaitAll()
 
-                val simulatedCloudPath = if (provider == "Google Drive") {
-                    "https://drive.google.com/drive/folders/backup_${UUID.randomUUID().toString().take(12)}/${file.fileName}"
-                } else if (provider == "Dropbox") {
-                    "https://www.dropbox.com/home/${_dropboxFolder.value}/${file.fileName}"
-                } else {
-                    "https://omni-vault.s3.us-west-2.amazonaws.com/u/vault_${UUID.randomUUID().toString().take(6)}_${file.fileName}"
-                }
-                val updatedFile = file.copy(
-                    syncStatus = "SYNCED",
-                    cloudUrl = simulatedCloudPath
-                )
-                repository.update(updatedFile)
-                addSyncLog("[Sync Engine] Securely uploaded chunk and verified. Remote URI generated: $simulatedCloudPath")
-            }
-
+            _lastSyncTimestamp.value = System.currentTimeMillis()
             _syncProgress.value = 1f
             _isSyncing.value = false
-            addSyncLog("[Sync Engine] All pending uploads resolved. State consolidated.")
+            addSyncLog("[Sync Engine] Multi-threaded deployment complete across all connected mirrors.")
+        }
+    }
+
+    private fun String.isIn(set: Set<String>) = set.contains(this)
+
+    // Consolidate universal repository by pulling definitions from the mirror matrix
+    fun consolidateUniversalRepository() {
+        viewModelScope.launch {
+            _isSyncing.value = true
+            _syncProgress.value = 0f
+            addSyncLog("[Universal Repo] Initializing cross-device consolidation protocol...")
+            delay(1000)
+            
+            addSyncLog("[Universal Repo] Syncing System Configuration from Mirror Matrix...")
+            delay(1000)
+            // Simulated pull of remote settings
+            val remoteCustomRule = "Always tag invoices as #tax-records"
+            if (_customRule.value != remoteCustomRule) {
+                _customRule.value = remoteCustomRule
+                settingsManager.setString(SettingsManager.KEY_CUSTOM_RULE, remoteCustomRule)
+                addSyncLog("[Universal Repo] Updated Classification Rule from remote master.")
+            }
+
+            addSyncLog("[Universal Repo] Accessing Global Manifest from Mirror Matrix...")
+            delay(800)
+            
+            // Simulated remote files found on other devices in the same universal repo
+            val mockRemoteFiles = listOf(
+                MediaFile(
+                    fileName = "remote_shared_asset_01.png",
+                    fileType = "IMAGE",
+                    sourceApp = "Shared (DEV-X92B)",
+                    fileSize = 2048576,
+                    timestamp = System.currentTimeMillis() - 86400000,
+                    category = "Work",
+                    syncStatus = "SYNCED",
+                    primaryUrl = "https://omni-primary.s3.amazonaws.com/u/remote_shared_asset_01.png",
+                    primarySyncStatus = "SYNCED"
+                ),
+                MediaFile(
+                    fileName = "universal_doc_v2.pdf",
+                    fileType = "DOCUMENT",
+                    sourceApp = "Shared (DEV-L041)",
+                    fileSize = 512000,
+                    timestamp = System.currentTimeMillis() - 172800000,
+                    category = "Finance",
+                    syncStatus = "SYNCED",
+                    primaryUrl = "https://omni-primary.s3.amazonaws.com/u/universal_doc_v2.pdf",
+                    primarySyncStatus = "SYNCED"
+                )
+            )
+            
+            var addedCount = 0
+            mockRemoteFiles.forEach { remoteFile ->
+                if (_mediaFiles.value.none { it.fileName == remoteFile.fileName }) {
+                    repository.insert(remoteFile)
+                    addedCount++
+                    addSyncLog("[Universal Repo] Imported remote reference: ${remoteFile.fileName}")
+                }
+            }
+            
+            _syncProgress.value = 1f
+            delay(500)
+            _isSyncing.value = false
+            addSyncLog("[Universal Repo] Consolidation complete. Found $addedCount new remote repository items.")
+        }
+    }
+
+    private fun detectAppRegistry(path: String): String {
+        return when {
+            path.contains("WhatsApp", true) -> "WhatsApp"
+            path.contains("Telegram", true) -> "Telegram"
+            path.contains("Signal", true) -> "Signal"
+            path.contains("Instagram", true) -> "Instagram"
+            path.contains("Facebook", true) -> "Facebook"
+            path.contains("Twitter", true) || path.contains("X-App", true) -> "X/Twitter"
+            path.contains("Snapchat", true) -> "Snapchat"
+            path.contains("Screenshots", true) -> "Screenshots"
+            path.contains("DCIM/Camera", true) -> "Camera"
+            path.contains("Download", true) -> "Downloads"
+            !path.contains("/emulated/0", true) -> "SD Card"
+            else -> {
+                // Heuristic: Extract the last folder name before the file name
+                val parts = path.split("/")
+                if (parts.size >= 2) {
+                    val folder = parts[parts.size - 2]
+                    if (folder.isNotEmpty() && folder != "0" && folder != "emulated") {
+                        folder.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
+                    } else "Device Storage"
+                } else "Device Storage"
+            }
         }
     }
 

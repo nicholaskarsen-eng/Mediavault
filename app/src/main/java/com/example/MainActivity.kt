@@ -2,6 +2,7 @@ package com.example
 
 import android.app.Application
 import android.os.Bundle
+import android.Manifest
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -59,6 +60,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextOverflow
@@ -70,20 +72,30 @@ import coil.compose.AsyncImage
 import com.example.data.database.MediaFile
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.viewmodel.MediaViewModel
-import com.example.ui.viewmodel.UploadTask
+import com.example.ui.viewmodel.CloudAccount
 import java.text.SimpleDateFormat
 import java.util.*
+
+import androidx.compose.ui.tooling.preview.Preview
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            MyApplicationTheme {
-                val app = applicationContext as Application
-                val viewModel: MediaViewModel = viewModel(
-                    factory = MediaViewModel.Factory(app)
-                )
+            val app = applicationContext as Application
+            val viewModel: MediaViewModel = viewModel(
+                factory = MediaViewModel.Factory(app)
+            )
+            val appTheme by viewModel.appTheme.collectAsStateWithLifecycle()
+            
+            MyApplicationTheme(
+                darkTheme = when(appTheme) {
+                    "Dark" -> true
+                    "Light" -> false
+                    else -> isSystemInDarkTheme()
+                }
+            ) {
                 MediaVaultApp(viewModel)
             }
         }
@@ -95,7 +107,21 @@ class MainActivity : ComponentActivity() {
 fun MediaVaultApp(viewModel: MediaViewModel) {
     val selectedTab by viewModel.selectedTab.collectAsStateWithLifecycle()
     val mediaFiles by viewModel.mediaFiles.collectAsStateWithLifecycle()
+    val isImporting by viewModel.isImporting.collectAsStateWithLifecycle()
+    val importProgress by viewModel.importProgress.collectAsStateWithLifecycle()
     val context = LocalContext.current
+
+    // Permissions for Deep Scan
+    val permissionsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = permissions.entries.all { it.value }
+        if (allGranted) {
+            viewModel.scanDeviceMedia()
+        } else {
+            Toast.makeText(context, "Storage permissions required for Deep Scan.", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     // Media importer launcher (Storage Access Framework)
     val contentResolver = context.contentResolver
@@ -153,229 +179,118 @@ fun MediaVaultApp(viewModel: MediaViewModel) {
                     .fillMaxHeight(),
                 windowInsets = WindowInsets(0.dp)
             ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(24.dp)
-                ) {
-                    // Drawer Header
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(44.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Lock,
-                                contentDescription = "Safe Lock Icon",
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(22.dp)
-                            )
-                        }
-                        Column {
-                            Text(
-                                text = "CIPHER VAULT",
-                                style = MaterialTheme.typography.titleMedium.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White,
-                                    letterSpacing = 1.sp
-                                )
-                            )
-                            Text(
-                                text = "Zero-Knowledge Sandbox",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    color = Color.LightGray.copy(alpha = 0.6f)
-                                )
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(28.dp))
-
-                    Text(
-                        text = "SECURE DECK NAVIGATION",
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f),
-                            letterSpacing = 1.2.sp
+                NavigationBarItem(
+                    selected = selectedTab == 0,
+                    onClick = { viewModel.selectTab(0) },
+                    icon = { Icon(Icons.Default.Menu, contentDescription = "Vault Files") },
+                    label = { Text("Vault", style = MaterialTheme.typography.labelSmall) },
+                    modifier = Modifier.testTag("tab_vault")
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 1,
+                    onClick = { viewModel.selectTab(1) },
+                    icon = { Icon(Icons.Default.Refresh, contentDescription = "Cloud Sync") },
+                    label = { Text("Sync", style = MaterialTheme.typography.labelSmall) },
+                    modifier = Modifier.testTag("tab_sync")
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 2,
+                    onClick = { viewModel.selectTab(2) },
+                    icon = { Icon(Icons.Default.Settings, contentDescription = "AI Organizer") },
+                    label = { Text("AI", style = MaterialTheme.typography.labelSmall) },
+                    modifier = Modifier.testTag("tab_ai")
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 3,
+                    onClick = { viewModel.selectTab(3) },
+                    icon = { Icon(Icons.Default.Build, contentDescription = "App Config") },
+                    label = { Text("Config", style = MaterialTheme.typography.labelSmall) },
+                    modifier = Modifier.testTag("tab_config")
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 4,
+                    onClick = { viewModel.selectTab(4) },
+                    icon = { Icon(Icons.Default.List, contentDescription = "System Logs") },
+                    label = { Text("Logs", style = MaterialTheme.typography.labelSmall) },
+                    modifier = Modifier.testTag("tab_logs")
+                )
+            }
+        }
+    ) { paddingValues ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(paddingValues)
+        ) {
+            // Background cosmic gradients
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawRect(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            Color(0xFF0F1A35),
+                            Color(0xFF070B19)
                         )
                     )
                     Spacer(modifier = Modifier.height(12.dp))
 
-                    // Navigation Options
-                    val tabs = listOf(
-                        Triple(0, "Vault Files", Icons.Default.Menu),
-                        Triple(1, "Cloud Sync", Icons.Default.Refresh),
-                        Triple(2, "AI Organizer", Icons.Default.Settings)
-                    )
-
-                    tabs.forEach { (index, title, icon) ->
-                        val isSelected = selectedTab == index
-                        NavigationDrawerItem(
-                            icon = {
-                                Icon(
-                                    imageVector = icon,
-                                    contentDescription = title,
-                                    tint = if (isSelected) Color.White else Color.LightGray
-                                )
-                            },
-                            label = {
-                                Text(
-                                    text = title,
-                                    style = MaterialTheme.typography.bodyMedium.copy(
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                        color = if (isSelected) Color.White else Color.LightGray
-                                    )
-                                )
-                            },
-                            selected = isSelected,
-                            onClick = {
-                                viewModel.selectTab(index)
-                                scope.launch { drawerState.close() }
-                            },
-                            shape = RoundedCornerShape(12.dp),
-                            colors = NavigationDrawerItemDefaults.colors(
-                                selectedContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.3f),
-                                unselectedContainerColor = Color.Transparent
-                            ),
-                            modifier = Modifier
-                                .padding(vertical = 4.dp)
-                                .testTag("drawer_tab_$index")
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.weight(1f))
-
-                    // Storage Quota Indicator Section
-                    val totalCapacityBytes = 512 * 1024 * 1024L // 512 MB
-                    val usedBytes = mediaFiles.sumOf { it.fileSize }
-                    val usedFraction = (usedBytes.toFloat() / totalCapacityBytes).coerceIn(0f, 1f)
-                    val percentUsedStr = "%.1f".format(usedFraction * 100f)
-                    
-                    val formattedUsed = "%.1f MB".format(usedBytes / (1024f * 1024f))
-                    val formattedCapacity = "512.0 MB"
-
-                    val quotaColor = when {
-                        usedFraction > 0.9f -> Color(0xFFEF4444)
-                        usedFraction > 0.7f -> Color(0xFFF59E0B)
-                        else -> MaterialTheme.colorScheme.primary
-                    }
-
-                    Card(
-                        colors = CardDefaults.cardColors(
-                            containerColor = Color.White.copy(alpha = 0.04f)
-                        ),
-                        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)),
-                        shape = RoundedCornerShape(16.dp),
+            if (isImporting) {
+                Column(modifier = Modifier.align(Alignment.TopCenter)) {
+                    LinearProgressIndicator(
+                        progress = { importProgress },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .testTag("storage_quota_card")
+                            .height(4.dp),
+                        color = MaterialTheme.colorScheme.secondary,
+                        trackColor = Color.Transparent
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(MaterialTheme.colorScheme.secondary.copy(alpha = 0.8f))
+                            .padding(vertical = 2.dp),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Column(
-                            modifier = Modifier.padding(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Info,
-                                        contentDescription = "Storage Status",
-                                        tint = quotaColor,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Text(
-                                        text = "STORAGE QUOTA",
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            color = Color.LightGray,
-                                            fontWeight = FontWeight.Bold,
-                                            letterSpacing = 0.8.sp
-                                        )
-                                    )
-                                }
-                                Text(
-                                    text = "$percentUsedStr%",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        color = quotaColor,
-                                        fontWeight = FontWeight.ExtraBold,
-                                        fontFamily = FontFamily.Monospace
-                                    ),
-                                    modifier = Modifier.testTag("quota_percentage_text")
-                                )
-                            }
-
-                            LinearProgressIndicator(
-                                progress = { usedFraction },
-                                color = quotaColor,
-                                trackColor = Color.White.copy(alpha = 0.1f),
-                                strokeCap = StrokeCap.Round,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(8.dp)
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .testTag("quota_progress_bar")
+                        Text(
+                            text = "Importing Media... ${(importProgress * 100).toInt()}%",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold
                             )
+                        )
+                    }
+                }
+            }
 
-                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(
-                                        text = "Used:",
-                                        style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray, fontSize = 11.sp)
-                                    )
-                                    Text(
-                                        text = formattedUsed,
-                                        style = MaterialTheme.typography.bodySmall.copy(color = Color.White, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, fontSize = 11.sp),
-                                        modifier = Modifier.testTag("quota_used_text")
-                                    )
-                                }
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(
-                                        text = "Limit:",
-                                        style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray, fontSize = 11.sp)
-                                    )
-                                    Text(
-                                        text = formattedCapacity,
-                                        style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray, fontFamily = FontFamily.Monospace, fontSize = 11.sp),
-                                        modifier = Modifier.testTag("quota_limit_text")
-                                    )
-                                }
+            AnimatedContent(
+                targetState = selectedTab,
+                transitionSpec = {
+                    slideInHorizontally { width -> if (targetState > initialState) width else -width } + fadeIn() togetherWith
+                            slideOutHorizontally { width -> if (targetState > initialState) -width else width } + fadeOut()
+                },
+                label = "tab_fade"
+            ) { tab ->
+                when (tab) {
+                    0 -> VaultView(
+                        mediaFiles = mediaFiles,
+                        viewModel = viewModel,
+                        onImportClick = {
+                            try {
+                                filePickerLauncher.launch(arrayOf("*/*"))
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "File picking not supported under this architecture.", Toast.LENGTH_SHORT).show()
                             }
-
-                            if (usedFraction > 0.9f) {
-                                Text(
-                                    text = "⚠️ Storage almost full! Sync uploads or purge locally cached directories.",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        color = Color(0xFFFEF08A),
-                                        fontSize = 9.sp,
-                                        lineHeight = 11.sp
+                        },
+                        onAutoImportClick = {
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                                permissionsLauncher.launch(
+                                    arrayOf(
+                                        android.Manifest.permission.READ_MEDIA_IMAGES,
+                                        android.Manifest.permission.READ_MEDIA_VIDEO,
+                                        android.Manifest.permission.READ_MEDIA_AUDIO
                                     )
                                 )
                             } else {
-                                Text(
-                                    text = "Automated high-fidelity sandbox encryption allocates isolated local sectors dynamically.",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        color = Color.Gray,
-                                        fontSize = 9.sp,
-                                        lineHeight = 11.sp
-                                    )
-                                )
+                                permissionsLauncher.launch(arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE))
                             }
                         }
                     }
@@ -401,77 +316,640 @@ fun MediaVaultApp(viewModel: MediaViewModel) {
                         label = { Text("Vault Files") },
                         modifier = Modifier.testTag("tab_vault")
                     )
-                    NavigationBarItem(
-                        selected = selectedTab == 1,
-                        onClick = { viewModel.selectTab(1) },
-                        icon = { Icon(Icons.Default.Refresh, contentDescription = "Cloud Sync") },
-                        label = { Text("Cloud Sync") },
-                        modifier = Modifier.testTag("tab_sync")
-                    )
-                    NavigationBarItem(
-                        selected = selectedTab == 2,
-                        onClick = { viewModel.selectTab(2) },
-                        icon = { Icon(Icons.Default.Settings, contentDescription = "AI Organizer") },
-                        label = { Text("AI Organizer") },
-                        modifier = Modifier.testTag("tab_ai")
+                    1 -> SyncView(viewModel)
+                    2 -> AIOrganizerView(mediaFiles, viewModel)
+                    3 -> ConfigView(viewModel)
+                    4 -> LogsView(viewModel)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun LogsView(viewModel: MediaViewModel) {
+    val aiLogs by viewModel.aiLogs.collectAsStateWithLifecycle()
+    val syncLogs by viewModel.syncLogs.collectAsStateWithLifecycle()
+    var selectedLogType by remember { mutableStateOf("All") }
+
+    val combinedLogs = remember(aiLogs, syncLogs, selectedLogType) {
+        val all = (aiLogs + syncLogs).sortedByDescending { it.takeWhile { char -> char != ']' } } // Heuristic sort
+        when (selectedLogType) {
+            "AI" -> aiLogs.reversed()
+            "Sync" -> syncLogs.reversed()
+            else -> all
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+    ) {
+        Text(
+            text = "System Protocols",
+            style = MaterialTheme.typography.headlineMedium.copy(
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
+        )
+        Text(
+            text = "Real-time execution telemetry and decision logs",
+            style = MaterialTheme.typography.bodyMedium.copy(color = Color.LightGray)
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            listOf("All", "AI", "Sync").forEach { type ->
+                val isSelected = selectedLogType == type
+                FilterChip(
+                    selected = isSelected,
+                    onClick = { selectedLogType = type },
+                    label = { Text(type) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        containerColor = Color.White.copy(alpha = 0.05f),
+                        labelColor = Color.Gray,
+                        selectedContainerColor = MaterialTheme.colorScheme.primary,
+                        selectedLabelColor = Color.White
+                    ),
+                    border = BorderStroke(1.dp, if (isSelected) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.1f))
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color.Black.copy(alpha = 0.6f))
+                .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(12.dp))
+        ) {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(combinedLogs) { log ->
+                    Text(
+                        text = log,
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                            color = when {
+                                log.contains("[AI]") -> Color(0xFFA5B4FC)
+                                log.contains("[Sync Engine]") -> Color(0xFFFDE047)
+                                log.contains("[System]") -> Color(0xFF38BDF8)
+                                log.contains("Error", ignoreCase = true) -> Color(0xFFEF4444)
+                                log.contains("Success", ignoreCase = true) -> Color(0xFF4ADE80)
+                                else -> Color.LightGray
+                            }
+                        )
                     )
                 }
             }
-        ) { paddingValues ->
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(paddingValues)
-            ) {
-                // Background cosmic gradients
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    drawRect(
-                        brush = Brush.radialGradient(
-                            colors = listOf(
-                                Color(0xFF0F1A35),
-                                Color(0xFF070B19)
-                            )
-                        )
-                    )
-                }
+        }
+    }
+}
 
-                AnimatedContent(
-                    targetState = selectedTab,
-                    transitionSpec = {
-                        slideInHorizontally { width -> if (targetState > initialState) width else -width } + fadeIn() togetherWith
-                                slideOutHorizontally { width -> if (targetState > initialState) -width else width } + fadeOut()
-                    },
-                    label = "tab_fade"
-                ) { tab ->
-                    when (tab) {
-                        0 -> VaultView(
-                            mediaFiles = mediaFiles,
-                            viewModel = viewModel,
-                            onImportClick = {
-                                try {
-                                    filePickerLauncher.launch(arrayOf("*/*"))
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "File picking not supported under this architecture.", Toast.LENGTH_SHORT).show()
-                                }
-                            },
-                            onMenuClick = {
-                                scope.launch { drawerState.open() }
-                            }
-                        )
-                        1 -> SyncView(
-                            viewModel = viewModel,
-                            onMenuClick = {
-                                scope.launch { drawerState.open() }
-                            }
-                        )
-                        2 -> AIOrganizerView(
-                            mediaFiles = mediaFiles,
-                            viewModel = viewModel,
-                            onMenuClick = {
-                                scope.launch { drawerState.open() }
-                            }
+@Composable
+fun ConfigView(viewModel: MediaViewModel) {
+    val customRule by viewModel.customRule.collectAsStateWithLifecycle()
+    val apiKeyField by viewModel.apiKey.collectAsStateWithLifecycle()
+    val isWifiOnlySync by viewModel.isWifiOnlySync.collectAsStateWithLifecycle()
+    val isCloudSyncEnabled by viewModel.isCloudSyncEnabled.collectAsStateWithLifecycle()
+    val isUniversalRepoEnabled by viewModel.isUniversalRepoEnabled.collectAsStateWithLifecycle()
+    val deviceId by viewModel.deviceId.collectAsStateWithLifecycle()
+    val isBiometricEnabled by viewModel.isBiometricEnabled.collectAsStateWithLifecycle()
+    val appTheme by viewModel.appTheme.collectAsStateWithLifecycle()
+    val autoOrganizeOnImport by viewModel.autoOrganizeOnImport.collectAsStateWithLifecycle()
+    val notificationsEnabled by viewModel.notificationsEnabled.collectAsStateWithLifecycle()
+    val selectedAiModel by viewModel.selectedAiModel.collectAsStateWithLifecycle()
+    val maxVaultSizeMb by viewModel.maxVaultSizeMb.collectAsStateWithLifecycle()
+    val autoDeleteAfterDays by viewModel.autoDeleteAfterDays.collectAsStateWithLifecycle()
+    val redundancyLevel by viewModel.redundancyLevel.collectAsStateWithLifecycle()
+    val connectedAccounts by viewModel.connectedAccounts.collectAsStateWithLifecycle()
+    val isApiKeyConfigured = viewModel.isApiKeyConfigured
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+            .verticalScroll(rememberScrollState())
+    ) {
+        Text(
+            text = "App Configuration",
+            style = MaterialTheme.typography.headlineMedium.copy(
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
+        )
+        Text(
+            text = "System preferences and security parameters",
+            style = MaterialTheme.typography.bodyMedium.copy(color = Color.LightGray)
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // --- AI & ENGINE ---
+        SettingsSectionHeader("AI & ENGINE")
+        
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Gemini API Connectivity",
+                        style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                    )
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(if (isApiKeyConfigured) Color(0xFF4CAF50) else Color(0xFFF44336))
+                            .padding(horizontal = 8.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = if (isApiKeyConfigured) "CONNECTED" else "MISSING KEY",
+                            style = MaterialTheme.typography.labelSmall.copy(color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.ExtraBold)
                         )
                     }
+                }
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                SettingSelectItem(
+                    title = "AI Model Engine",
+                    options = listOf("gemini-1.5-flash", "gemini-1.5-pro"),
+                    selectedOption = selectedAiModel,
+                    onOptionSelected = { viewModel.updateSelectedAiModel(it) }
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                Text(
+                    text = "GEMINI API KEY",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = Color.LightGray,
+                        letterSpacing = 0.5.sp
+                    )
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = apiKeyField,
+                    onValueChange = { viewModel.updateApiKey(it) },
+                    placeholder = { Text("Paste your Gemini API key here...", fontSize = 12.sp) },
+                    modifier = Modifier.fillMaxWidth(),
+                    textStyle = MaterialTheme.typography.bodySmall,
+                    visualTransformation = if (apiKeyField.length > 4) androidx.compose.ui.text.input.PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        unfocusedBorderColor = Color.White.copy(alpha = 0.2f)
+                    )
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                Text(
+                    text = "GLOBAL CLASSIFICATION RULE",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = Color.LightGray,
+                        letterSpacing = 0.5.sp
+                    )
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = customRule,
+                    onValueChange = { viewModel.updateCustomRule(it) },
+                    placeholder = { Text("e.g. Always categorize dark memes as 'Dark Humour'...", fontSize = 12.sp) },
+                    modifier = Modifier.fillMaxWidth(),
+                    textStyle = MaterialTheme.typography.bodySmall,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        unfocusedBorderColor = Color.White.copy(alpha = 0.2f)
+                    )
+                )
+                
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                SettingSwitchItem(
+                    title = "Auto-Organize on Import",
+                    description = "Trigger AI analysis immediately when new media is detected.",
+                    checked = autoOrganizeOnImport,
+                    onCheckedChange = { viewModel.updateAutoOrganizeOnImport(it) }
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // --- CLOUD ACCOUNTS ---
+        SettingsSectionHeader("CLOUD ACCOUNTS")
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                connectedAccounts.forEach { account ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(text = account.accountName, style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold))
+                            Text(text = "${account.provider} • ${account.region} • ${account.type}", style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray))
+                        }
+                        IconButton(onClick = { viewModel.unlinkAccount(account.id) }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Remove account", tint = Color.Gray, modifier = Modifier.size(16.dp))
+                        }
+                    }
+                    if (account != connectedAccounts.last()) {
+                        Divider(color = Color.White.copy(alpha = 0.05f), modifier = Modifier.padding(vertical = 4.dp))
+                    }
+                }
+                
+                if (connectedAccounts.isEmpty()) {
+                    Text(text = "No cloud accounts linked.", style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray))
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                
+                var showAddMenu by remember { mutableStateOf(false) }
+                
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(modifier = Modifier.weight(1f)) {
+                        Button(
+                            onClick = { showAddMenu = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.1f)),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("+ Add Account", fontSize = 10.sp)
+                        }
+                        
+                        DropdownMenu(
+                            expanded = showAddMenu,
+                            onDismissRequest = { showAddMenu = false },
+                            modifier = Modifier.background(Color(0xFF1E293B))
+                        ) {
+                            val providers = listOf(
+                                Triple("AWS S3", "us-east-1", "Primary"),
+                                Triple("Azure Blob", "westeurope", "Backup"),
+                                Triple("Google Cloud", "us-central1", "Archive"),
+                                Triple("DigitalOcean", "nyc3", "DR"),
+                                Triple("Backblaze B2", "us-west-004", "Backup")
+                            )
+                            
+                            providers.forEach { (prov, reg, type) ->
+                                DropdownMenuItem(
+                                    text = { 
+                                        Column {
+                                            Text(prov, color = Color.White, style = MaterialTheme.typography.bodySmall)
+                                            Text(reg, color = Color.Gray, fontSize = 9.sp)
+                                        }
+                                    },
+                                    onClick = {
+                                        viewModel.linkAccount(prov, "node-${reg}-${(10..99).random()}", reg, type)
+                                        showAddMenu = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+
+                    Button(
+                        onClick = { viewModel.autoConfigureRedundancyFromAccounts() },
+                        modifier = Modifier.weight(1.2f),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("Auto-Sync Config", fontSize = 10.sp)
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                Button(
+                    onClick = { viewModel.syncConfigurationToCloud() },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = isCloudSyncEnabled && isUniversalRepoEnabled,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.05f)),
+                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(14.dp), tint = Color.LightGray)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Push System Config to Matrix", fontSize = 10.sp, color = Color.White)
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // --- STORAGE & CLEANUP ---
+        SettingsSectionHeader("STORAGE & CLEANUP")
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    text = "Vault Size Limit: $maxVaultSizeMb MB",
+                    style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                )
+                Slider(
+                    value = maxVaultSizeMb.toFloat(),
+                    onValueChange = { viewModel.updateMaxVaultSize(it.toInt()) },
+                    valueRange = 100f..2000f,
+                    steps = 19,
+                    colors = SliderDefaults.colors(
+                        thumbColor = MaterialTheme.colorScheme.primary,
+                        activeTrackColor = MaterialTheme.colorScheme.primary
+                    )
+                )
+                
+                Divider(color = Color.White.copy(alpha = 0.05f), modifier = Modifier.padding(vertical = 12.dp))
+
+                Text(
+                    text = "Auto-Delete Retention: ${if (autoDeleteAfterDays == 0) "Disabled" else "$autoDeleteAfterDays Days"}",
+                    style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                )
+                Slider(
+                    value = autoDeleteAfterDays.toFloat(),
+                    onValueChange = { viewModel.updateAutoDeleteAfterDays(it.toInt()) },
+                    valueRange = 0f..90f,
+                    steps = 90,
+                    colors = SliderDefaults.colors(
+                        thumbColor = MaterialTheme.colorScheme.secondary,
+                        activeTrackColor = MaterialTheme.colorScheme.secondary
+                    )
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // --- NETWORK & SYNC ---
+        SettingsSectionHeader("NETWORK & SYNC")
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                SettingSwitchItem(
+                    title = "Enable Cloud Mirroring",
+                    description = "Activate multi-node redundancy across the storage matrix.",
+                    checked = isCloudSyncEnabled,
+                    onCheckedChange = { viewModel.updateCloudSyncEnabled(it) }
+                )
+                
+                Divider(color = Color.White.copy(alpha = 0.05f), modifier = Modifier.padding(vertical = 12.dp))
+
+                SettingSwitchItem(
+                    title = "Sync over Wi-Fi only",
+                    description = "Reduce mobile data usage by restricting cloud mirror uploads to Wi-Fi.",
+                    checked = isWifiOnlySync,
+                    onCheckedChange = { viewModel.updateWifiOnlySync(it) }
+                )
+                
+                Divider(color = Color.White.copy(alpha = 0.05f), modifier = Modifier.padding(vertical = 12.dp))
+
+                SettingSwitchItem(
+                    title = "Universal Repository Protocol",
+                    description = "Allow cross-device asset consolidation and shared metadata indexing.",
+                    checked = isUniversalRepoEnabled,
+                    onCheckedChange = { viewModel.updateUniversalRepoEnabled(it) }
+                )
+                
+                if (isUniversalRepoEnabled) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Device Signature: $deviceId",
+                        style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.secondary, fontFamily = FontFamily.Monospace)
+                    )
+                }
+                
+                Divider(color = Color.White.copy(alpha = 0.05f), modifier = Modifier.padding(vertical = 12.dp))
+                
+                Text(
+                    text = "Sync Redundancy Nodes: $redundancyLevel",
+                    style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                )
+                Text(
+                    text = "Number of simultaneous cloud mirrors to maintain.",
+                    style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray)
+                )
+                Slider(
+                    value = redundancyLevel.toFloat(),
+                    onValueChange = { viewModel.updateRedundancyLevel(it.toInt()) },
+                    valueRange = 1f..4f,
+                    steps = 2,
+                    colors = SliderDefaults.colors(
+                        thumbColor = MaterialTheme.colorScheme.primary,
+                        activeTrackColor = MaterialTheme.colorScheme.primary
+                    )
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // --- PREFERENCES & SECURITY ---
+        SettingsSectionHeader("PREFERENCES & SECURITY")
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                SettingSelectItem(
+                    title = "App Theme",
+                    options = listOf("Light", "Dark", "System"),
+                    selectedOption = appTheme,
+                    onOptionSelected = { viewModel.updateAppTheme(it) }
+                )
+                
+                Divider(color = Color.White.copy(alpha = 0.05f), modifier = Modifier.padding(vertical = 12.dp))
+                
+                SettingSwitchItem(
+                    title = "Enable Notifications",
+                    description = "Receive alerts for sync completion and AI analysis results.",
+                    checked = notificationsEnabled,
+                    onCheckedChange = { viewModel.updateNotificationsEnabled(it) }
+                )
+                
+                Divider(color = Color.White.copy(alpha = 0.05f), modifier = Modifier.padding(vertical = 12.dp))
+                
+                SettingSwitchItem(
+                    title = "Biometric Lock",
+                    description = "Require fingerprint or face unlock to access the Secure Vault.",
+                    checked = isBiometricEnabled,
+                    onCheckedChange = { viewModel.updateBiometricEnabled(it) }
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // --- DANGER ZONE ---
+        SettingsSectionHeader("DANGER ZONE", color = Color(0xFFEF4444))
+        Button(
+            onClick = { viewModel.clearAll() },
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444).copy(alpha = 0.1f)),
+            border = BorderStroke(1.dp, Color(0xFFEF4444)),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Icon(Icons.Default.Delete, contentDescription = null, tint = Color(0xFFEF4444))
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Purge All Local Vault Data", color = Color(0xFFEF4444))
+        }
+        
+        Spacer(modifier = Modifier.height(40.dp))
+        
+        // --- ABOUT ---
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Image(
+                imageVector = Icons.Default.Info,
+                contentDescription = null,
+                colorFilter = ColorFilter.tint(Color.DarkGray),
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "Media Vault OSync v2.1.0",
+                style = MaterialTheme.typography.labelSmall.copy(color = Color.DarkGray, fontWeight = FontWeight.Bold)
+            )
+            Text(
+                text = "Secure Sandbox Architecture • AES-256 Encryption",
+                style = MaterialTheme.typography.labelSmall.copy(color = Color.DarkGray, fontSize = 9.sp)
+            )
+            Text(
+                text = "© 2024 AI Studio Hub. All rights reserved.",
+                style = MaterialTheme.typography.labelSmall.copy(color = Color.DarkGray, fontSize = 8.sp)
+            )
+        }
+        
+        Spacer(modifier = Modifier.height(24.dp))
+    }
+}
+
+@Composable
+fun SettingsSectionHeader(title: String, color: Color = MaterialTheme.colorScheme.primary) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.labelSmall.copy(
+            fontWeight = FontWeight.Bold,
+            color = color,
+            letterSpacing = 1.sp
+        ),
+        modifier = Modifier.padding(start = 4.dp, bottom = 8.dp)
+    )
+}
+
+@Composable
+fun SettingSwitchItem(
+    title: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
+            )
+            Text(
+                text = description,
+                style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray)
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(
+                checkedThumbColor = MaterialTheme.colorScheme.primary,
+                checkedTrackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
+                uncheckedThumbColor = Color.Gray,
+                uncheckedTrackColor = Color.White.copy(alpha = 0.1f)
+            )
+        )
+    }
+}
+
+@Composable
+fun SettingSelectItem(
+    title: String,
+    options: List<String>,
+    selectedOption: String,
+    onOptionSelected: (String) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
+        )
+        
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .background(Color.White.copy(alpha = 0.05f))
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            options.forEach { option ->
+                val isSelected = option == selectedOption
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent)
+                        .clickable { onOptionSelected(option) }
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = option,
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            color = if (isSelected) Color.White else Color.LightGray,
+                            fontWeight = FontWeight.Bold
+                        )
+                    )
                 }
             }
         }
@@ -484,7 +962,7 @@ fun VaultView(
     mediaFiles: List<MediaFile>,
     viewModel: MediaViewModel,
     onImportClick: () -> Unit,
-    onMenuClick: () -> Unit
+    onAutoImportClick: () -> Unit
 ) {
     var selectedCategoryFilter by remember { mutableStateOf("All") }
     val activeUploads by viewModel.activeUploads.collectAsStateWithLifecycle()
@@ -492,7 +970,6 @@ fun VaultView(
     val showUndoToast by viewModel.showUndoToast.collectAsStateWithLifecycle()
     val lastDeletedFiles by viewModel.lastDeletedFiles.collectAsStateWithLifecycle()
     var selectedAppFilter by remember { mutableStateOf("All") }
-    var showAddDialog by remember { mutableStateOf(false) }
     var selectedFileForDetailId by remember { mutableStateOf<Int?>(null) }
     val selectedFileForDetail = remember(selectedFileForDetailId, mediaFiles) {
         mediaFiles.find { it.id == selectedFileForDetailId }
@@ -599,35 +1076,15 @@ fun VaultView(
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp)
-        ) {
-        // Upper Title Header
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
+    val headerContent = @Composable {
+        Column {
+            // Upper Title Header
             Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(
-                    onClick = onMenuClick,
-                    modifier = Modifier
-                        .size(40.dp)
-                        .testTag("vault_menu_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Menu,
-                        contentDescription = "Open Sidebar Navigation Menu",
-                        tint = Color.White
-                    )
-                }
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = "Secure Vault",
                         style = MaterialTheme.typography.headlineMedium.copy(
@@ -636,1188 +1093,388 @@ fun VaultView(
                         )
                     )
                     Text(
-                        text = "${mediaFiles.size} Items Indexed Locally",
-                        style = MaterialTheme.typography.bodyMedium.copy(color = Color.LightGray)
+                        text = "${mediaFiles.size} Items Indexed",
+                        style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
                     )
                 }
-            }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = onImportClick,
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.primary
-                    ),
-                    modifier = Modifier.testTag("import_file_button")
-                ) {
-                    Icon(Icons.Default.Share, contentDescription = "Import file", modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Import")
-                }
-
-                FilledIconButton(
-                    onClick = { showAddDialog = true },
-                    modifier = Modifier
-                        .size(40.dp)
-                        .testTag("show_add_dialog_button"),
-                    colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = MaterialTheme.colorScheme.secondary
-                    )
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = "Simulate Inbound File")
-                }
-
-                FilledIconButton(
-                    onClick = { viewModel.refreshMedia() },
-                    modifier = Modifier
-                        .size(40.dp)
-                        .testTag("refresh_media_button"),
-                    colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
-                ) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Refresh & Fetch Media")
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Text(
-            text = "CONNECTED APP REGISTRIES",
-            style = MaterialTheme.typography.labelSmall.copy(
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f),
-                letterSpacing = 1.2.sp
-            ),
-            modifier = Modifier.padding(bottom = 6.dp)
-        )
-
-        // Source Connected Apps Hub
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .padding(bottom = 14.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            val monitoredApps = listOf("All", "WhatsApp", "Telegram", "Screenshots", "Camera", "Downloads", "Discord", "Slack")
-            monitoredApps.forEach { app ->
-                val count = if (app == "All") mediaFiles.size else mediaFiles.count { it.sourceApp.equals(app, ignoreCase = true) }
-                val sizeBytes = if (app == "All") mediaFiles.sumOf { it.fileSize } else mediaFiles.filter { it.sourceApp.equals(app, ignoreCase = true) }.sumOf { it.fileSize }
-                val sizeMb = sizeBytes / (1024f * 1024f)
-                val isSelected = selectedAppFilter == app
-
-                val appColor = when (app) {
-                    "WhatsApp" -> Color(0xFF25D366)
-                    "Telegram" -> Color(0xFF0088CC)
-                    "Screenshots" -> Color(0xFF9C27B0)
-                    "Camera" -> Color(0xFFFF9800)
-                    "Downloads" -> Color(0xFF78909C)
-                    "Discord" -> Color(0xFF5865F2)
-                    "Slack" -> Color(0xFFE01E5A)
-                    else -> MaterialTheme.colorScheme.primary
-                }
-
-                Card(
-                    modifier = Modifier
-                        .width(130.dp)
-                        .clickable { selectedAppFilter = app }
-                        .testTag("source_app_card_$app"),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = if (isSelected) appColor.copy(alpha = 0.15f) else Color.White.copy(alpha = 0.04f)
-                    ),
-                    border = BorderStroke(
-                        width = 1.5.dp,
-                        color = if (isSelected) appColor else Color.White.copy(alpha = 0.08f)
-                    )
-                ) {
-                    Column(
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    IconButton(
+                        onClick = onImportClick,
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.primary)
+                            .testTag("import_file_button")
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                        Icon(Icons.Default.Share, contentDescription = "Import", tint = Color.White)
+                    }
+
+                    IconButton(
+                        onClick = onAutoImportClick,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color(0xFF673AB7))
+                            .testTag("auto_import_button")
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Auto Import", tint = Color.White)
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text(
+                text = "APP REGISTRIES",
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.8f),
+                    letterSpacing = 1.2.sp
+                ),
+                modifier = Modifier.padding(bottom = 6.dp)
+            )
+
+            // Source Connected Apps Hub
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(bottom = 14.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                val monitoredApps = listOf("All", "WhatsApp", "Telegram", "Screenshots", "Camera", "Downloads", "Discord", "Slack", "SD Card")
+                monitoredApps.forEach { app ->
+                    val count = if (app == "All") mediaFiles.size else mediaFiles.count { it.sourceApp.equals(app, ignoreCase = true) }
+                    val sizeBytes = if (app == "All") mediaFiles.sumOf { it.fileSize } else mediaFiles.filter { it.sourceApp.equals(app, ignoreCase = true) }.sumOf { it.fileSize }
+                    val sizeMb = sizeBytes / (1024f * 1024f)
+                    val isSelected = selectedAppFilter == app
+
+                    val appColor = when (app) {
+                        "WhatsApp" -> Color(0xFF25D366)
+                        "Telegram" -> Color(0xFF0088CC)
+                        "Screenshots" -> Color(0xFF9C27B0)
+                        "Camera" -> Color(0xFFFF9800)
+                        "Downloads" -> Color(0xFF78909C)
+                        "Discord" -> Color(0xFF5865F2)
+                        "Slack" -> Color(0xFFE01E5A)
+                        "SD Card" -> Color(0xFF4CAF50)
+                        else -> MaterialTheme.colorScheme.primary
+                    }
+
+                    Card(
+                        modifier = Modifier
+                            .width(100.dp)
+                            .clickable { selectedAppFilter = app }
+                            .testTag("source_app_card_$app"),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isSelected) appColor.copy(alpha = 0.15f) else Color.White.copy(alpha = 0.04f)
+                        ),
+                        border = BorderStroke(
+                            width = 1.dp,
+                            color = if (isSelected) appColor else Color.White.copy(alpha = 0.08f)
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(8.dp)
-                                    .clip(CircleShape)
-                                    .background(appColor)
-                            )
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .background(appColor.copy(alpha = 0.2f))
-                                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(appColor)
+                                )
                                 Text(
                                     text = "$count",
                                     style = MaterialTheme.typography.labelSmall.copy(
                                         color = appColor,
                                         fontWeight = FontWeight.Bold,
-                                        fontSize = 9.sp
+                                        fontSize = 8.sp
                                     )
                                 )
                             }
-                        }
 
-                        Text(
-                            text = app,
-                            style = MaterialTheme.typography.titleSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
-                            ),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-
-                        Text(
-                            text = "%.1f MB".format(sizeMb),
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color.Gray,
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 10.sp
-                            )
-                        )
-                    }
-                }
-            }
-        }
-
-        // Secure Media Upload & AI Tagging Component
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 12.dp)
-                .testTag("secure_upload_card"),
-            shape = RoundedCornerShape(14.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = Color(0xFF16223F).copy(alpha = 0.5f)
-            ),
-            border = BorderStroke(1.dp, Color(0xFF2C3E6B))
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(14.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.Lock,
-                            contentDescription = "Secure Encryption Lock Icon",
-                            tint = Color(0xFF4CAF50),
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "SECURE VAULT UPLOADER & EYE-WITNESS",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                                letterSpacing = 1.sp
-                            )
-                        )
-                    }
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(4.dp))
-                            .background(Color(0xFF2196F3).copy(alpha = 0.2f))
-                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = "GEMINI AI INTEGRATED",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color(0xFF2196F3),
-                                fontSize = 8.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Action Upload click-zone
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(Color.White.copy(alpha = 0.03f))
-                        .border(
-                            width = 1.dp,
-                            color = Color.White.copy(alpha = 0.1f),
-                            shape = RoundedCornerShape(10.dp)
-                        )
-                        .clickable { onImportClick() }
-                        .padding(vertical = 14.dp, horizontal = 12.dp)
-                        .testTag("tap_to_upload_zone"),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.AddCircle,
-                            contentDescription = "Upload Plus Icon",
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(28.dp)
-                        )
-                        Text(
-                            text = "Tap to securely upload/import media",
-                            style = MaterialTheme.typography.bodyMedium.copy(
-                                fontWeight = FontWeight.SemiBold,
-                                color = Color.White
-                            )
-                        )
-                        Text(
-                            text = "Locally encrypted via AES-256 and automatically auto-tagged by Gemini AI",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color.Gray,
-                                fontSize = 10.sp
-                            )
-                        )
-                    }
-                }
-
-                // If any active uploads, list them!
-                if (activeUploads.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text(
-                        text = "ACTIVE UPLOAD & TAG QUEUE (${activeUploads.size}):",
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = Color.LightGray,
-                            fontSize = 10.sp
-                        )
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        activeUploads.forEach { task ->
-                            Card(
-                                colors = CardDefaults.cardColors(
-                                    containerColor = Color.White.copy(alpha = 0.05f)
-                                ),
-                                shape = RoundedCornerShape(8.dp),
-                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.06f)),
-                                modifier = Modifier.fillMaxWidth().testTag("upload_task_${task.id}")
-                            ) {
-                                Column(modifier = Modifier.padding(10.dp)) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = task.fileName,
-                                                style = MaterialTheme.typography.titleSmall.copy(
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = Color.White
-                                                ),
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                            Text(
-                                                text = "Size: %.2f MB".format(task.totalSize / (1024f * 1024f)),
-                                                style = MaterialTheme.typography.labelSmall.copy(
-                                                    color = Color.Gray,
-                                                    fontSize = 10.sp
-                                                )
-                                            )
-                                        }
-
-                                        // Status badge
-                                        val statusColor = when (task.status) {
-                                            "ENCRYPTING" -> Color(0xFFFFA726)
-                                            "UPLOADING" -> Color(0xFF29B6F6)
-                                            "ANALYZING_AI" -> Color(0xFFAB47BC)
-                                            "COMPLETED" -> Color(0xFF66BB6A)
-                                            else -> Color(0xFFEF5350)
-                                        }
-                                        val statusText = when (task.status) {
-                                            "ENCRYPTING" -> "🛡️ ENCRYPTING..."
-                                            "UPLOADING" -> "📤 BLOCK TRANSFER..."
-                                            "ANALYZING_AI" -> "🧠 GEMINI TAGGING..."
-                                            "COMPLETED" -> "✅ SECURELY ARCHIVED"
-                                            else -> "❌ ERROR"
-                                        }
-                                        Box(
-                                            modifier = Modifier
-                                                .clip(RoundedCornerShape(4.dp))
-                                                .background(statusColor.copy(alpha = 0.15f))
-                                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                                        ) {
-                                            Text(
-                                                text = statusText,
-                                                style = MaterialTheme.typography.labelSmall.copy(
-                                                    color = statusColor,
-                                                    fontSize = 9.sp,
-                                                    fontWeight = FontWeight.Bold
-                                                )
-                                            )
-                                        }
-
-                                        // Close/remove button only if completed
-                                        if (task.status == "COMPLETED" || task.status == "FAILED") {
-                                            IconButton(
-                                                onClick = { viewModel.removeActiveUpload(task.id) },
-                                                modifier = Modifier.size(24.dp).padding(start = 4.dp).testTag("dismiss_upload_${task.id}")
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Default.Close,
-                                                    contentDescription = "Dismiss Active Upload View",
-                                                    tint = Color.Gray,
-                                                    modifier = Modifier.size(14.dp)
-                                                )
-                                            }
-                                        }
-                                    }
-
-                                    Spacer(modifier = Modifier.height(8.dp))
-
-                                    // Progress bar
-                                    LinearProgressIndicator(
-                                        progress = { task.progress },
-                                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(CircleShape).testTag("upload_progress_${task.id}"),
-                                        color = if (task.status == "COMPLETED") Color(0xFF4CAF50) else MaterialTheme.colorScheme.primary,
-                                        trackColor = Color.White.copy(alpha = 0.1f)
-                                    )
-
-                                    if (task.status == "COMPLETED" && task.tags.isNotEmpty()) {
-                                        Spacer(modifier = Modifier.height(6.dp))
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text(
-                                                text = "AI tags generated:",
-                                                style = MaterialTheme.typography.labelSmall.copy(
-                                                    color = Color.LightGray,
-                                                    fontSize = 10.sp
-                                                )
-                                            )
-                                            task.tags.take(3).forEach { tag ->
-                                                Box(
-                                                    modifier = Modifier
-                                                        .clip(RoundedCornerShape(4.dp))
-                                                        .background(Color.White.copy(alpha = 0.1f))
-                                                        .padding(horizontal = 4.dp, vertical = 2.dp)
-                                                ) {
-                                                    Text(
-                                                        text = "#$tag",
-                                                        style = MaterialTheme.typography.labelSmall.copy(
-                                                            color = Color.LightGray,
-                                                            fontSize = 9.sp
-                                                        )
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Warning banner if API key is not configured
-        if (!viewModel.isApiKeyConfigured) {
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = Color(0xFFD32F2F).copy(alpha = 0.2f),
-                    contentColor = Color.White
-                ),
-                shape = RoundedCornerShape(12.dp),
-                border = BorderStroke(1.dp, Color(0xFFD32F2F)),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 12.dp)
-            ) {
-                Row(
-                    modifier = Modifier.padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        Icons.Default.Warning,
-                        contentDescription = "API warning key missing",
-                        tint = Color(0xFFFF5252),
-                        modifier = Modifier.size(24.dp)
-                    )
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Column {
-                        Text(
-                            text = "Offline Mode Active (No API Key)",
-                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
-                        )
-                        Text(
-                            text = "Simulate real Gemini categorization or configure your GEMINI_API_KEY inside the Secrets Panel.",
-                            style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
-                        )
-                    }
-                }
-            }
-        }
-
-        // Search Input Component
-        OutlinedTextField(
-            value = searchQuery,
-            onValueChange = { searchQuery = it },
-            placeholder = { Text("Search tags, categories, filenames, metadata...", color = Color.Gray) },
-            leadingIcon = {
-                Icon(
-                    imageVector = Icons.Default.Search,
-                    contentDescription = "Search Icon",
-                    tint = Color.LightGray
-                )
-            },
-            trailingIcon = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(end = 4.dp)
-                ) {
-                    IconButton(
-                        onClick = { showSearchFiltersHelp = !showSearchFiltersHelp },
-                        modifier = Modifier.testTag("search_help_toggle_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Info,
-                            contentDescription = "Search Guidelines & Metadata Help",
-                            tint = if (showSearchFiltersHelp) MaterialTheme.colorScheme.primary else Color.LightGray,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                    if (searchQuery.isNotEmpty()) {
-                        IconButton(
-                            onClick = { searchQuery = "" },
-                            modifier = Modifier.testTag("clear_search_input_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Clear Search",
-                                tint = Color.LightGray,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-                    }
-                }
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 12.dp)
-                .testTag("media_search_input"),
-            singleLine = true,
-            shape = RoundedCornerShape(12.dp),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedTextColor = Color.White,
-                unfocusedTextColor = Color.White,
-                focusedBorderColor = MaterialTheme.colorScheme.primary,
-                unfocusedBorderColor = Color.White.copy(alpha = 0.2f),
-                focusedContainerColor = Color.White.copy(alpha = 0.05f),
-                unfocusedContainerColor = Color.White.copy(alpha = 0.05f)
-            )
-        )
-
-        // Interactive Advanced Search Guide / Help Card
-        if (showSearchFiltersHelp) {
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = Color(0xFF141F39)
-                ),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 12.dp)
-                    .animateContentSize()
-                    .testTag("search_metadata_guide_card")
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Info,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(16.dp)
-                            )
                             Text(
-                                "ADVANCED SEARCH METADATA FILTERS",
+                                text = app,
                                 style = MaterialTheme.typography.labelMedium.copy(
                                     fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    letterSpacing = 0.5.sp
-                                )
-                            )
-                        }
-                        TextButton(
-                            onClick = { showSearchFiltersHelp = false },
-                            contentPadding = PaddingValues(0.dp),
-                            modifier = Modifier.height(24.dp).testTag("hide_search_guide_button")
-                        ) {
-                            Text("HIDE", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, color = Color.Gray))
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Query your library by searching for filename terms, AI tags, or enter structured metadata tokens to narrow down files. Click an example below to insert it:",
-                        style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    
-                    val shortcuts = listOf(
-                        "type:image" to "Filter library files by Category Image (or 'type:video')",
-                        "app:WhatsApp" to "Search originating source application (WhatsApp, Camera, etc.)",
-                        "ext:jpg" to "Filter precise file formats/extensions (jpg, png, mp4)",
-                        "size>1MB" to "Logical file size comparison (e.g. size<500KB)",
-                        "#receipt" to "Seek specific AI classified tag names"
-                    )
-                    
-                    shortcuts.forEach { (query, desc) ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp)
-                                .clickable {
-                                    searchQuery = query
-                                }
-                                .testTag("search_shortcut_$query"),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = query,
-                                style = MaterialTheme.typography.labelMedium.copy(
-                                    fontFamily = FontFamily.Monospace,
-                                    color = MaterialTheme.colorScheme.secondary,
-                                    fontWeight = FontWeight.Bold
+                                    color = Color.White
                                 ),
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .background(Color.White.copy(alpha = 0.05f))
-                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
+
                             Text(
-                                text = desc,
-                                style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray, fontSize = 11.sp),
-                                modifier = Modifier.padding(start = 8.dp)
+                                text = "%.1f MB".format(sizeMb),
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = Color.Gray,
+                                    fontSize = 9.sp
+                                )
                             )
                         }
                     }
                 }
             }
-        }
 
-        // Dynamic AI Tag Quick-Filters Row
-        if (aiTags.isNotEmpty()) {
+            // Warning banner if API key is not configured
+            if (!viewModel.isApiKeyConfigured) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = Color(0xFFD32F2F).copy(alpha = 0.2f),
+                        contentColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, Color(0xFFD32F2F)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Warning,
+                            contentDescription = "API warning",
+                            tint = Color(0xFFFF5252),
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "Offline Mode (No API Key)",
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                            )
+                            Text(
+                                text = "Update .env file with your API key.",
+                                style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray, fontSize = 10.sp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Search Input Component
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                placeholder = { Text("Search vault...", color = Color.Gray, style = MaterialTheme.typography.bodySmall) },
+                leadingIcon = {
+                    Icon(
+                        imageVector = Icons.Default.Search,
+                        contentDescription = "Search",
+                        tint = Color.LightGray,
+                        modifier = Modifier.size(18.dp)
+                    )
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp)
+                    .testTag("media_search_input"),
+                singleLine = true,
+                shape = RoundedCornerShape(12.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    focusedBorderColor = MaterialTheme.colorScheme.primary,
+                    unfocusedBorderColor = Color.White.copy(alpha = 0.2f),
+                    focusedContainerColor = Color.White.copy(alpha = 0.05f),
+                    unfocusedContainerColor = Color.White.copy(alpha = 0.05f)
+                )
+            )
+
+            // Horizontal filter chips
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .horizontalScroll(rememberScrollState())
-                    .padding(bottom = 12.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Star,
-                    contentDescription = "AI Tags",
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(14.dp)
-                )
-                Text(
-                    text = "AI Tags Filter:",
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        color = Color.LightGray,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 11.sp
-                    )
-                )
-                aiTags.forEach { tag ->
-                    val isTagActive = searchQuery == "#$tag"
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(
-                                if (isTagActive) MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)
-                                else Color.White.copy(alpha = 0.08f)
-                            )
-                            .border(
-                                1.dp,
-                                if (isTagActive) MaterialTheme.colorScheme.primary else Color.Transparent,
-                                RoundedCornerShape(6.dp)
-                            )
-                            .clickable {
-                                searchQuery = if (isTagActive) "" else "#$tag"
-                            }
-                            .padding(horizontal = 8.dp, vertical = 4.dp)
-                            .testTag("ai_tag_chip_$tag")
-                    ) {
-                        Text(
-                            text = "#$tag",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = if (isTagActive) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.8f),
-                                fontSize = 10.sp
-                            )
-                        )
-                    }
-                }
-            }
-        }
-
-        // Horizontal filter chips
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .padding(vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            categories.forEach { cat ->
-                val isSelected = cat == selectedCategoryFilter
-                FilterChip(
-                    selected = isSelected,
-                    onClick = { selectedCategoryFilter = cat },
-                    label = { Text(cat) },
-                    colors = FilterChipDefaults.filterChipColors(
-                        containerColor = Color.White.copy(alpha = 0.1f),
-                        labelColor = Color.White,
-                        selectedContainerColor = MaterialTheme.colorScheme.primary,
-                        selectedLabelColor = Color.White
-                    ),
-                    border = BorderStroke(
-                        1.dp,
-                        if (isSelected) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.2f)
-                    )
-                )
-            }
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // Chronological Date-Range Preset Filter Chips
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Text(
-                text = "Date:",
-                style = MaterialTheme.typography.bodySmall.copy(
-                    color = Color.Gray,
-                    fontWeight = FontWeight.SemiBold
-                )
-            )
-            
-            val datePresets = listOf("All Time", "Today", "Last 7 Days", "Last 30 Days", "Custom Range")
-            Row(
-                modifier = Modifier
-                    .weight(1f)
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                datePresets.forEach { preset ->
-                    val isSelected = selectedDatePresetText == preset
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(
-                                if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
-                                else Color.White.copy(alpha = 0.05f)
-                            )
-                            .clickable {
-                                selectedDatePresetText = preset
-                                when (preset) {
-                                    "All Time" -> {
-                                        startDateMills = null
-                                        endDateMills = null
-                                    }
-                                    "Today" -> {
-                                        val cal = Calendar.getInstance()
-                                        startDateMills = getStartOfDay(cal)
-                                        endDateMills = getEndOfDay(cal)
-                                    }
-                                    "Last 7 Days" -> {
-                                        val cal = Calendar.getInstance()
-                                        endDateMills = getEndOfDay(cal)
-                                        cal.add(Calendar.DAY_OF_YEAR, -7)
-                                        startDateMills = getStartOfDay(cal)
-                                    }
-                                    "Last 30 Days" -> {
-                                        val cal = Calendar.getInstance()
-                                        endDateMills = getEndOfDay(cal)
-                                        cal.add(Calendar.DAY_OF_YEAR, -30)
-                                        startDateMills = getStartOfDay(cal)
-                                    }
-                                    "Custom Range" -> {
-                                        showDatePickerDialog = true
-                                    }
-                                }
-                            }
-                            .padding(horizontal = 10.dp, vertical = 6.dp)
-                            .testTag("date_preset_$preset")
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            if (preset == "Custom Range") {
-                                Icon(
-                                    imageVector = Icons.Default.DateRange,
-                                    contentDescription = "Custom Date Range Icon",
-                                    tint = if (isSelected) MaterialTheme.colorScheme.primary else Color.LightGray,
-                                    modifier = Modifier.size(12.dp)
-                                )
-                            }
-                            Text(
-                                text = if (preset == "Custom Range" && startDateMills != null && endDateMills != null) {
-                                    val sdf = SimpleDateFormat("MM/dd", Locale.getDefault())
-                                    "${sdf.format(Date(startDateMills!!))} - ${sdf.format(Date(endDateMills!!))}"
-                                } else {
-                                    preset
-                                },
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    color = if (isSelected) MaterialTheme.colorScheme.primary else Color.LightGray,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(6.dp))
-
-        // Sorting Option Chips Row
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Text(
-                text = "Sort by:",
-                style = MaterialTheme.typography.bodySmall.copy(
-                    color = Color.Gray,
-                    fontWeight = FontWeight.SemiBold
-                )
-            )
-            listOf("Relevance", "Newest", "Size").forEach { opt ->
-                val isSelected = sortBy == opt
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(
-                            if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
-                            else Color.White.copy(alpha = 0.05f)
-                        )
-                        .clickable { sortBy = opt }
-                        .padding(horizontal = 10.dp, vertical = 6.dp)
-                        .testTag("sort_opt_$opt")
-                ) {
-                    Text(
-                        text = when (opt) {
-                            "Relevance" -> "✦ Relevance"
-                            "Newest" -> "🕰 Newest"
-                            "Size" -> "💾 Size"
-                            else -> opt
-                        },
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            color = if (isSelected) MaterialTheme.colorScheme.primary else Color.LightGray,
-                            fontWeight = FontWeight.Bold
-                        )
-                    )
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(4.dp))
-
-        // Grid/List toggle toolbar
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "${filteredFiles.size} items matching",
-                style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
-            )
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
+                    .padding(vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                // Multi-select toggle button
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(if (isMultiSelectMode) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.White.copy(alpha = 0.08f))
-                        .border(
-                            1.dp, 
-                            if (isMultiSelectMode) MaterialTheme.colorScheme.primary else Color.Transparent, 
-                            RoundedCornerShape(8.dp)
+                categories.forEach { cat ->
+                    val isSelected = cat == selectedCategoryFilter
+                    FilterChip(
+                        selected = isSelected,
+                        onClick = { selectedCategoryFilter = cat },
+                        label = { Text(cat, style = MaterialTheme.typography.labelSmall) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            containerColor = Color.White.copy(alpha = 0.1f),
+                            labelColor = Color.White,
+                            selectedContainerColor = MaterialTheme.colorScheme.primary,
+                            selectedLabelColor = Color.White
+                        ),
+                        border = BorderStroke(
+                            1.dp,
+                            if (isSelected) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.2f)
                         )
-                        .clickable {
-                            isMultiSelectMode = !isMultiSelectMode
-                            if (!isMultiSelectMode) {
-                                selectedFileIds.clear()
-                            }
-                        }
-                        .padding(horizontal = 10.dp, vertical = 6.dp)
-                        .testTag("toggle_multiselect")
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            // Sorting & Toggle toolbar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Compact sort picker
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier.horizontalScroll(rememberScrollState())
                 ) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = if (isMultiSelectMode) Icons.Default.CheckCircle else Icons.Default.List,
-                            contentDescription = "Multi Select Toggle",
-                            tint = if (isMultiSelectMode) MaterialTheme.colorScheme.primary else Color.White,
-                            modifier = Modifier.size(14.dp)
-                        )
-                        Text(
-                            text = if (isMultiSelectMode) "Select Mode" else "Select",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color.White,
-                                fontWeight = FontWeight.Bold
+                    listOf("Relevance", "Newest", "Size").forEach { opt ->
+                        val isSelected = sortBy == opt
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(
+                                    if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)
+                                    else Color.White.copy(alpha = 0.05f)
+                                )
+                                .clickable { sortBy = opt }
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                .testTag("sort_opt_$opt")
+                        ) {
+                            Text(
+                                text = opt,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = if (isSelected) MaterialTheme.colorScheme.primary else Color.LightGray,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp
+                                )
                             )
-                        )
+                        }
                     }
                 }
 
+                // View mode toggle
                 Row(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
+                        .clip(RoundedCornerShape(6.dp))
                         .background(Color.White.copy(alpha = 0.08f))
                         .padding(2.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
                     Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
+                            .clip(RoundedCornerShape(4.dp))
                             .background(if (viewMode == "list") MaterialTheme.colorScheme.primary else Color.Transparent)
                             .clickable { viewMode = "list" }
-                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
                             .testTag("toggle_list_view")
                     ) {
                         Text(
                             text = "List",
                             style = MaterialTheme.typography.labelSmall.copy(
                                 color = Color.White,
-                                fontWeight = FontWeight.Bold
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 10.sp
                             )
                         )
                     }
                     Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
+                            .clip(RoundedCornerShape(4.dp))
                             .background(if (viewMode == "grid") MaterialTheme.colorScheme.primary else Color.Transparent)
                             .clickable { viewMode = "grid" }
-                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
                             .testTag("toggle_grid_view")
                     ) {
                         Text(
                             text = "Grid",
                             style = MaterialTheme.typography.labelSmall.copy(
                                 color = Color.White,
-                                fontWeight = FontWeight.Bold
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 10.sp
                             )
                         )
                     }
                 }
             }
-        }
-
-        Spacer(modifier = Modifier.height(4.dp))
-
-        // Files Grid Explorer
-        if (isLoading) {
-            if (viewMode == "grid") {
-                LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 160.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    items(6) {
-                        MediaFileGridCardSkeleton()
-                    }
-                }
-            } else {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    items(5) {
-                        MediaFileRowSkeleton()
-                    }
-                }
-            }
-        } else if (filteredFiles.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        Icons.Default.Info,
-                        contentDescription = "No media files in repository",
-                        tint = Color.Gray,
-                        modifier = Modifier.size(64.dp)
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text(
-                        text = "No files match active filter.",
-                        style = MaterialTheme.typography.titleMedium.copy(color = Color.White)
-                    )
-                    Text(
-                        text = "Add simulated files or import actual resources.",
-                        style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
-                    )
-                }
-            }
-        } else {
-            if (viewMode == "grid") {
-                LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 160.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    itemsIndexed(sortedFiles) { index, file ->
-                        val isSelected = selectedFileIds.contains(file.id)
-                        AnimatedEntranceContainer(index = index) {
-                            MediaFileGridCard(
-                                file = file,
-                                onOrganizeClick = { viewModel.organizeSingleFile(file) },
-                                onDeleteClick = { viewModel.deleteFile(file.id) },
-                                onCardClick = {
-                                    if (isMultiSelectMode) {
-                                        if (isSelected) {
-                                            selectedFileIds.remove(file.id)
-                                        } else {
-                                            selectedFileIds.add(file.id)
-                                        }
-                                    } else {
-                                        fullScreenViewerFileId = file.id
-                                    }
-                                },
-                                onTagClick = { tag ->
-                                    searchQuery = tag
-                                    val key = tag.lowercase().trim()
-                                    tagSearchFrequency[key] = (tagSearchFrequency[key] ?: 0) + 1
-                                },
-                                relevanceScore = calculateRelevance(file, searchQuery, tagSearchFrequency),
-                                isMultiSelectMode = isMultiSelectMode,
-                                isSelected = isSelected,
-                                onLongClick = {
-                                    if (!isMultiSelectMode) {
-                                        isMultiSelectMode = true
-                                        selectedFileIds.clear()
-                                        selectedFileIds.add(file.id)
-                                    }
-                                }
-                            )
-                        }
-                    }
-                }
-            } else {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    itemsIndexed(sortedFiles) { index, file ->
-                        val isSelected = selectedFileIds.contains(file.id)
-                        AnimatedEntranceContainer(index = index) {
-                            MediaFileRow(
-                                file = file,
-                                onOrganizeClick = { viewModel.organizeSingleFile(file) },
-                                onDeleteClick = { viewModel.deleteFile(file.id) },
-                                onCardClick = {
-                                    if (isMultiSelectMode) {
-                                        if (isSelected) {
-                                            selectedFileIds.remove(file.id)
-                                        } else {
-                                            selectedFileIds.add(file.id)
-                                        }
-                                    } else {
-                                        fullScreenViewerFileId = file.id
-                                    }
-                                },
-                                onTagClick = { tag ->
-                                    searchQuery = tag
-                                    val key = tag.lowercase().trim()
-                                    tagSearchFrequency[key] = (tagSearchFrequency[key] ?: 0) + 1
-                                },
-                                relevanceScore = calculateRelevance(file, searchQuery, tagSearchFrequency),
-                                isMultiSelectMode = isMultiSelectMode,
-                                isSelected = isSelected,
-                                onLongClick = {
-                                    if (!isMultiSelectMode) {
-                                        isMultiSelectMode = true
-                                        selectedFileIds.clear()
-                                        selectedFileIds.add(file.id)
-                                    }
-                                }
-                            )
-                        }
-                    }
-                }
-            }
+            
+            Text(
+                text = "${filteredFiles.size} items matching",
+                style = MaterialTheme.typography.labelSmall.copy(color = Color.Gray),
+                modifier = Modifier.padding(bottom = 8.dp)
+            )
         }
     }
 
-    // Animated Batch Action Bar Overlay
-        AnimatedVisibility(
-            visible = isMultiSelectMode,
-            enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
-            exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(16.dp)
-        ) {
-            Card(
-                colors = CardDefaults.cardColors(
-                    containerColor = Color(0xFF1E293B).copy(alpha = 0.95f)
-                ),
-                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
-                shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.12f)),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("batch_action_bar")
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp)
+    ) {
+        if (viewMode == "grid") {
+            LazyVerticalGrid(
+                columns = GridCells.Adaptive(150.dp),
+                modifier = Modifier.fillMaxSize(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(vertical = 16.dp)
             ) {
-                Column(
-                    modifier = Modifier.padding(12.dp)
-                ) {
-                    // TOP Row: Title & count, selection toggle, close button
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.List,
-                                contentDescription = "Selection Count",
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Text(
-                                text = "${selectedFileIds.size} files selected",
-                                style = MaterialTheme.typography.titleSmall.copy(
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            )
-                        }
+                item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
+                    headerContent()
+                }
 
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            // Select All / Deselect All Toggle button
-                            TextButton(
-                                onClick = {
-                                    if (selectedFileIds.size == sortedFiles.size) {
-                                        selectedFileIds.clear()
-                                    } else {
-                                        selectedFileIds.clear()
-                                        selectedFileIds.addAll(sortedFiles.map { it.id })
-                                    }
-                                },
-                                modifier = Modifier.testTag("batch_select_all_toggle")
-                            ) {
-                                Text(
-                                    text = if (selectedFileIds.size == sortedFiles.size) "Deselect All" else "Select All",
-                                    style = MaterialTheme.typography.bodySmall.copy(
-                                        color = MaterialTheme.colorScheme.primary,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                )
-                            }
-
-                            // Done / Cancel button
-                            IconButton(
-                                onClick = {
-                                    isMultiSelectMode = false
-                                    selectedFileIds.clear()
-                                },
-                                modifier = Modifier
-                                    .size(32.dp)
-                                    .clip(CircleShape)
-                                    .background(Color.White.copy(alpha = 0.08f))
-                                    .testTag("batch_cancel_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Cancel Multi-select",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            }
-                        }
+                if (filteredFiles.isEmpty()) {
+                    item(span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
+                        EmptyVaultState()
                     }
+                } else {
+                    items(sortedFiles) { file ->
+                        MediaFileGridCard(
+                            file = file,
+                            onOrganizeClick = { viewModel.organizeSingleFile(file) },
+                            onDeleteClick = { viewModel.deleteFile(file.id) },
+                            onCardClick = { selectedFileForDetailId = file.id },
+                            onTagClick = { tag ->
+                                searchQuery = tag
+                                val key = tag.lowercase().trim()
+                                tagSearchFrequency[key] = (tagSearchFrequency[key] ?: 0) + 1
+                            },
+                            relevanceScore = calculateRelevance(file, searchQuery, tagSearchFrequency)
+                        )
+                    }
+                }
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(vertical = 16.dp)
+            ) {
+                item {
+                    headerContent()
+                }
 
-                    HorizontalDivider(color = Color.White.copy(alpha = 0.08f), modifier = Modifier.padding(vertical = 8.dp))
-
-                    // BOTTOM Row: List of operations (Delete / Move to folder)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        // "Delete Selected" Button
-                        Button(
-                            onClick = {
-                                if (selectedFileIds.isNotEmpty()) {
-                                    viewModel.deleteMultipleFiles(selectedFileIds.toList())
-                                    selectedFileIds.clear()
-                                    isMultiSelectMode = false
-                                }
+                if (filteredFiles.isEmpty()) {
+                    item {
+                        EmptyVaultState()
+                    }
+                } else {
+                    items(sortedFiles) { file ->
+                        MediaFileRow(
+                            file = file,
+                            onOrganizeClick = { viewModel.organizeSingleFile(file) },
+                            onDeleteClick = { viewModel.deleteFile(file.id) },
+                            onCardClick = { selectedFileForDetailId = file.id },
+                            onTagClick = { tag ->
+                                searchQuery = tag
+                                val key = tag.lowercase().trim()
+                                tagSearchFrequency[key] = (tagSearchFrequency[key] ?: 0) + 1
                             },
                             enabled = selectedFileIds.isNotEmpty(),
                             colors = ButtonDefaults.buttonColors(
@@ -2077,7 +1734,7 @@ fun VaultView(
         }
     }
 
-    // Detail Dialog Sheet / Immersive Custom Overlay Modal Component
+    // Detail Dialog Sheet ...
     if (selectedFileForDetail != null) {
         val fileDetail = selectedFileForDetail!!
         val isOrganizing by viewModel.isOrganizing.collectAsStateWithLifecycle()
@@ -2132,306 +1789,6 @@ fun VaultView(
                 selectedCategoryFilter = category
             },
             isOrganizing = isOrganizing
-        )
-    }
-
-    // Add Simulated File Dialog
-    if (showAddDialog) {
-        var addName by remember { mutableStateOf("project_chart_analysis.png") }
-        var addType by remember { mutableStateOf("IMAGE") }
-        var addApp by remember { mutableStateOf("WhatsApp") }
-        var addSizeMb by remember { mutableStateOf("3.5") }
-
-        AlertDialog(
-            onDismissRequest = { showAddDialog = false },
-            title = { Text("Simulate Inbound App Media", color = Color.White) },
-            text = {
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    OutlinedTextField(
-                        value = addName,
-                        onValueChange = { addName = it },
-                        label = { Text("Filename + Extension") },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = Color.White.copy(alpha = 0.3f)
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    // Type selectors
-                    Text("Media Type Identifier", color = Color.LightGray, style = MaterialTheme.typography.labelMedium)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        listOf("IMAGE", "VIDEO", "AUDIO", "DOCUMENT").forEach { type ->
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(
-                                        if (addType == type) MaterialTheme.colorScheme.primary else Color.White.copy(
-                                            alpha = 0.08f
-                                        )
-                                    )
-                                    .clickable { addType = type }
-                                    .padding(vertical = 8.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = type,
-                                    style = MaterialTheme.typography.bodySmall.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White
-                                    )
-                                )
-                            }
-                        }
-                    }
-
-                    // Source app selector
-                    Text("Inbound App Context Source", color = Color.LightGray, style = MaterialTheme.typography.labelMedium)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState())
-                            .padding(vertical = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        listOf("WhatsApp", "Telegram", "Screenshots", "Camera", "Downloads", "Discord", "Slack").forEach { app ->
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(
-                                        if (addApp == app) MaterialTheme.colorScheme.secondary else Color.White.copy(
-                                            alpha = 0.08f
-                                        )
-                                    )
-                                    .clickable { addApp = app }
-                                    .padding(horizontal = 14.dp, vertical = 10.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = app,
-                                    style = MaterialTheme.typography.bodySmall.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White
-                                    )
-                                )
-                            }
-                        }
-                    }
-
-                    OutlinedTextField(
-                        value = addSizeMb,
-                        onValueChange = { addSizeMb = it },
-                        label = { Text("Sizing (MB)") },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = Color.White.copy(alpha = 0.3f)
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val sizeVal = addSizeMb.toDoubleOrNull() ?: 1.0
-                        viewModel.addSimulatedFile(addName, addType, addApp, sizeVal)
-                        showAddDialog = false
-                    },
-                    modifier = Modifier.testTag("confirm_add_button")
-                ) {
-                    Text("Add Registry")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showAddDialog = false }) {
-                    Text("Cancel", color = Color.White)
-                }
-            },
-            containerColor = Color(0xFF141F39),
-            shape = RoundedCornerShape(16.dp)
-        )
-    }
-
-    if (showBulkTagsDialog) {
-        AlertDialog(
-            onDismissRequest = { showBulkTagsDialog = false },
-            title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Edit,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Text("Bulk Add Custom Tags", color = Color.White)
-                }
-            },
-            text = {
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Text(
-                        text = "Adding custom tags to ${selectedFileIds.size} selected file(s). Enter multiple tags separated by commas.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.LightGray
-                    )
-                    OutlinedTextField(
-                        value = bulkTagsInput,
-                        onValueChange = { bulkTagsInput = it },
-                        placeholder = { Text("e.g. invoice, project-alpha, q2-report") },
-                        label = { Text("Custom Tags") },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = Color.White.copy(alpha = 0.3f),
-                            focusedLabelColor = MaterialTheme.colorScheme.primary,
-                            unfocusedLabelColor = Color.Gray
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("bulk_tags_input_field")
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (bulkTagsInput.isNotBlank()) {
-                            viewModel.addTagsToMultipleFiles(selectedFileIds.toList(), bulkTagsInput)
-                            selectedFileIds.clear()
-                            isMultiSelectMode = false
-                        }
-                        showBulkTagsDialog = false
-                    },
-                    enabled = bulkTagsInput.isNotBlank(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.primary
-                    ),
-                    modifier = Modifier.testTag("confirm_bulk_tags_button")
-                ) {
-                    Text("Apply Tags")
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = { showBulkTagsDialog = false },
-                    modifier = Modifier.testTag("cancel_bulk_tags_button")
-                ) {
-                    Text("Cancel", color = Color.White)
-                }
-            },
-            containerColor = Color(0xFF141F39),
-            shape = RoundedCornerShape(16.dp)
-        )
-    }
-
-    if (showBulkMoveDialog) {
-        AlertDialog(
-            onDismissRequest = { showBulkMoveDialog = false },
-            title = {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Send,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Text("Move to Custom Category", color = Color.White)
-                }
-            },
-            text = {
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Text(
-                        text = "Move ${selectedFileIds.size} selected file(s) to a custom category name.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Color.LightGray
-                    )
-                    OutlinedTextField(
-                        value = bulkCategoryInput,
-                        onValueChange = { bulkCategoryInput = it },
-                        placeholder = { Text("e.g. Legal Documents, Vacation 2026") },
-                        label = { Text("Category Name") },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = Color.White.copy(alpha = 0.3f),
-                            focusedLabelColor = MaterialTheme.colorScheme.primary,
-                            unfocusedLabelColor = Color.Gray
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("bulk_category_input_field")
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val cleanedCategory = bulkCategoryInput.trim()
-                        if (cleanedCategory.isNotEmpty()) {
-                            viewModel.moveMultipleFilesToCategory(selectedFileIds.toList(), cleanedCategory)
-                            selectedFileIds.clear()
-                            isMultiSelectMode = false
-                        }
-                        showBulkMoveDialog = false
-                    },
-                    enabled = bulkCategoryInput.isNotBlank(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.primary
-                    ),
-                    modifier = Modifier.testTag("confirm_bulk_move_button")
-                ) {
-                    Text("Move Files")
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = { showBulkMoveDialog = false },
-                    modifier = Modifier.testTag("cancel_bulk_move_button")
-                ) {
-                    Text("Cancel", color = Color.White)
-                }
-            },
-            containerColor = Color(0xFF141F39),
-            shape = RoundedCornerShape(16.dp)
-        )
-    }
-
-    if (showDatePickerDialog) {
-        CustomDatePickerDialog(
-            initialStartMillis = startDateMills,
-            initialEndMillis = endDateMills,
-            onDismissRequest = { showDatePickerDialog = false },
-            onDateRangeSelected = { start, end ->
-                startDateMills = start
-                endDateMills = end
-                if (start == null && end == null) {
-                    selectedDatePresetText = "All Time"
-                } else {
-                    selectedDatePresetText = "Custom Range"
-                }
-            }
         )
     }
 }
@@ -2506,24 +1863,33 @@ fun MediaFileRow(
                     .background(Color.White.copy(alpha = 0.08f)),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(
-                    imageVector = when (file.fileType) {
-                        "IMAGE" -> Icons.Default.Share
-                        "VIDEO" -> Icons.Default.PlayArrow
-                        "AUDIO" -> Icons.Default.Share
-                        else -> Icons.Default.Info
-                    },
-                    contentDescription = file.fileType,
-                    tint = when (file.category) {
-                        "Finance" -> Color(0xFF4CAF50)
-                        "Memes" -> Color(0xFFFF9800)
-                        "Work" -> Color(0xFF2196F3)
-                        "Recordings" -> Color(0xFFE91E63)
-                        "Screenshots" -> Color(0xFF9C27B0)
-                        else -> Color.White
-                    },
-                    modifier = Modifier.size(24.dp)
-                )
+                if (!file.localUri.isNullOrEmpty() && (file.fileType == "IMAGE" || file.fileType == "VIDEO")) {
+                    AsyncImage(
+                        model = file.localUri,
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    Icon(
+                        imageVector = when (file.fileType) {
+                            "IMAGE" -> Icons.Default.Share
+                            "VIDEO" -> Icons.Default.PlayArrow
+                            "AUDIO" -> Icons.Default.Share
+                            else -> Icons.Default.Info
+                        },
+                        contentDescription = file.fileType,
+                        tint = when (file.category) {
+                            "Finance" -> Color(0xFF4CAF50)
+                            "Memes" -> Color(0xFFFF9800)
+                            "Work" -> Color(0xFF2196F3)
+                            "Recordings" -> Color(0xFFE91E63)
+                            "Screenshots" -> Color(0xFF9C27B0)
+                            else -> Color.White
+                        },
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.width(12.dp))
@@ -3009,27 +2375,75 @@ fun MediaFileGridCard(
                     .background(Color(0xFF0F172A)),
                 contentAlignment = Alignment.Center
             ) {
-                AsyncImage(
-                    model = getMediaAestheticUrl(file),
-                    contentDescription = "Thumbnail for ${file.fileName}",
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
-                )
+                if (!file.localUri.isNullOrEmpty() && (file.fileType == "IMAGE" || file.fileType == "VIDEO")) {
+                    AsyncImage(
+                        model = file.localUri,
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                    if (file.fileType == "VIDEO") {
+                        Icon(
+                            imageVector = Icons.Default.PlayArrow,
+                            contentDescription = null,
+                            tint = Color.White.copy(alpha = 0.8f),
+                            modifier = Modifier
+                                .size(36.dp)
+                                .background(Color.Black.copy(alpha = 0.3f), CircleShape)
+                                .clickable {
+                                    try {
+                                        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                                            setDataAndType(android.net.Uri.parse(file.localUri!!), "video/*")
+                                            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        }
+                                        // Use local context from composition
+                                    } catch (e: Exception) {}
+                                }
+                                .padding(4.dp)
+                        )
+                    }
+                } else {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        drawLine(
+                            color = Color.White.copy(alpha = 0.1f),
+                            start = androidx.compose.ui.geometry.Offset(0f, 0f),
+                            end = androidx.compose.ui.geometry.Offset(size.width, size.height),
+                            strokeWidth = 2f
+                        )
+                        drawLine(
+                            color = Color.White.copy(alpha = 0.1f),
+                            start = androidx.compose.ui.geometry.Offset(size.width, 0f),
+                            end = androidx.compose.ui.geometry.Offset(0f, size.height),
+                            strokeWidth = 2f
+                        )
+                    }
 
-                // Top shadow gradient/overlay to ensure high text contrast
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(
-                            brush = Brush.verticalGradient(
-                                colors = listOf(
-                                    Color.Black.copy(alpha = 0.4f),
-                                    Color.Transparent,
-                                    Color.Black.copy(alpha = 0.5f)
-                                )
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = when (file.fileType) {
+                                "IMAGE" -> Icons.Default.Share
+                                "VIDEO" -> Icons.Default.PlayArrow
+                                "AUDIO" -> Icons.Default.Share
+                                else -> Icons.Default.Info
+                            },
+                            contentDescription = file.fileType,
+                            tint = Color.White.copy(alpha = 0.9f),
+                            modifier = Modifier.size(32.dp)
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = file.fileType,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                color = Color.White.copy(alpha = 0.7f),
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 1.sp
                             )
                         )
-                )
+                    }
+                }
 
                 if (file.fileType == "VIDEO") {
                     Box(
@@ -3265,50 +2679,18 @@ fun SyncView(
     onMenuClick: () -> Unit
 ) {
     val isSyncing by viewModel.isSyncing.collectAsStateWithLifecycle()
+    val isCloudSyncEnabled by viewModel.isCloudSyncEnabled.collectAsStateWithLifecycle()
+    val isUniversalRepoEnabled by viewModel.isUniversalRepoEnabled.collectAsStateWithLifecycle()
     val syncProgress by viewModel.syncProgress.collectAsStateWithLifecycle()
     val syncLogs by viewModel.syncLogs.collectAsStateWithLifecycle()
     val mediaFiles by viewModel.mediaFiles.collectAsStateWithLifecycle()
-    val isBackgroundSyncScheduled by viewModel.isBackgroundSyncScheduled.collectAsStateWithLifecycle()
-    val syncIntervalMinutes by viewModel.syncIntervalMinutes.collectAsStateWithLifecycle()
-    val isScanningDuplicates by viewModel.isScanningDuplicates.collectAsStateWithLifecycle()
+    val connectedAccounts by viewModel.connectedAccounts.collectAsStateWithLifecycle()
 
-    val googleDriveEmail by viewModel.googleDriveEmail.collectAsStateWithLifecycle()
-    val googleDriveFolder by viewModel.googleDriveFolder.collectAsStateWithLifecycle()
-    val dropboxEmail by viewModel.dropboxEmail.collectAsStateWithLifecycle()
-    val dropboxFolder by viewModel.dropboxFolder.collectAsStateWithLifecycle()
-    val preferredCloudRepository by viewModel.preferredCloudRepository.collectAsStateWithLifecycle()
-
-    var showGoogleLinkDialog by remember { mutableStateOf(false) }
-    var showDropboxLinkDialog by remember { mutableStateOf(false) }
-
-    val pendingCount = mediaFiles.count { it.syncStatus == "PENDING" }
+    val pendingCount = mediaFiles.count { it.syncStatus != "SYNCED" }
     val syncedCount = mediaFiles.count { it.syncStatus == "SYNCED" }
-    val totalSize = mediaFiles.sumOf { it.fileSize }
     val syncedSize = mediaFiles.filter { it.syncStatus == "SYNCED" }.sumOf { it.fileSize }
 
-    if (showGoogleLinkDialog) {
-        CloudLinkDialog(
-            providerName = "Google Drive",
-            accentColor = Color(0xFF34A853),
-            onDismiss = { showGoogleLinkDialog = false },
-            onLinkSuccess = { email, folder ->
-                viewModel.linkGoogleDrive(email, folder)
-                showGoogleLinkDialog = false
-            }
-        )
-    }
-
-    if (showDropboxLinkDialog) {
-        CloudLinkDialog(
-            providerName = "Dropbox",
-            accentColor = Color(0xFF0061FE),
-            onDismiss = { showDropboxLinkDialog = false },
-            onLinkSuccess = { email, folder ->
-                viewModel.linkDropbox(email, folder)
-                showDropboxLinkDialog = false
-            }
-        )
-    }
+    var showAddAccountDialog by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -3359,19 +2741,17 @@ fun SyncView(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(160.dp)
+                .height(120.dp)
                 .clip(RoundedCornerShape(16.dp))
                 .border(2.dp, Brush.horizontalGradient(listOf(Color(0xFF2196F3), Color(0xFFE91E63))), RoundedCornerShape(16.dp))
         ) {
-            // Load custom generated image from drawable resources
             Image(
                 painter = painterResource(id = R.drawable.media_vault_banner_1782142258765),
-                contentDescription = "Cloud repository vector artwork decor",
+                contentDescription = "Cloud repository artwork",
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
             )
             
-            // Text overlays
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -3388,7 +2768,7 @@ fun SyncView(
                         )
                     )
                     Text(
-                        "256-bit AES client-to-cloud security enabled.",
+                        "End-to-end encrypted multi-mirror deployment.",
                         style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
                     )
                 }
@@ -3406,16 +2786,108 @@ fun SyncView(
                 modifier = Modifier.weight(1f),
                 title = "PENDING CLOUD",
                 count = "$pendingCount Files",
-                description = "%.1f MB payload".format(mediaFiles.filter { it.syncStatus == "PENDING" }.sumOf { it.fileSize } / 1048576f),
+                description = "%.1f MB payload".format(mediaFiles.filter { it.syncStatus != "SYNCED" }.sumOf { it.fileSize } / 1048576f),
                 tint = Color(0xFFFF9800)
             )
             SyncMetricCard(
                 modifier = Modifier.weight(1f),
-                title = "REMOTE STORAGE",
-                count = "$syncedCount Files",
-                description = "%.1f MB storage".format(syncedSize / 1048576f),
-                tint = Color(0xFF4CAF50)
+                title = "MIRROR NODES",
+                count = "${connectedAccounts.size} Active",
+                description = connectedAccounts.joinToString(", ") { it.type },
+                tint = Color(0xFF00BCD4)
             )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Connected Mirror Nodes List
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "CONNECTED MIRROR NODES",
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontWeight = FontWeight.Bold,
+                    color = Color.LightGray
+                )
+            )
+            TextButton(onClick = { showAddAccountDialog = true }) {
+                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Link Node")
+            }
+        }
+        
+        Spacer(modifier = Modifier.height(8.dp))
+        
+        connectedAccounts.forEach { account ->
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f))
+            ) {
+                Row(
+                    modifier = Modifier.padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(32.dp)
+                            .clip(CircleShape)
+                            .background(
+                                when(account.type) {
+                                    "Primary" -> Color(0xFF2196F3)
+                                    "Backup" -> Color(0xFF4CAF50)
+                                    "Archive" -> Color(0xFFFFC107)
+                                    "DR" -> Color(0xFFE91E63)
+                                    else -> Color.Gray
+                                }.copy(alpha = 0.2f)
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = when(account.type) {
+                                "Primary" -> Icons.Default.Cloud
+                                "Backup" -> Icons.Default.CloudCircle
+                                "Archive" -> Icons.Default.Storage
+                                "DR" -> Icons.Default.Security
+                                else -> Icons.Default.CloudQueue
+                            },
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = when(account.type) {
+                                "Primary" -> Color(0xFF2196F3)
+                                "Backup" -> Color(0xFF4CAF50)
+                                "Archive" -> Color(0xFFFFC107)
+                                "DR" -> Color(0xFFE91E63)
+                                else -> Color.Gray
+                            }
+                        )
+                    }
+                    
+                    Spacer(modifier = Modifier.width(12.dp))
+                    
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = account.accountName,
+                            style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
+                        )
+                        Text(
+                            text = "${account.provider} • ${account.region} • ${account.type}",
+                            style = MaterialTheme.typography.labelSmall.copy(color = Color.Gray)
+                        )
+                    }
+                    
+                    IconButton(onClick = { viewModel.unlinkAccount(account.id) }) {
+                        Icon(Icons.Default.Close, contentDescription = "Unlink", tint = Color.Gray, modifier = Modifier.size(16.dp))
+                    }
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -3455,24 +2927,28 @@ fun SyncView(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = if (isSyncing) "Uploading secure payload chunks... (${(syncProgress * 100).toInt()}%)" else "Sync Consolidated",
-                        style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
+                        text = if (isCloudSyncEnabled) {
+                            if (isSyncing) "Syncing to ${connectedAccounts.size} mirror nodes..." 
+                            else "Cloud synchronization is ACTIVE."
+                        } else "Cloud synchronization is DISABLED.",
+                        style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray),
+                        modifier = Modifier.weight(1f)
                     )
 
                     Button(
                         onClick = { viewModel.syncNow() },
-                        enabled = !isSyncing && pendingCount > 0,
+                        enabled = isCloudSyncEnabled && !isSyncing && pendingCount > 0 && connectedAccounts.isNotEmpty(),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = MaterialTheme.colorScheme.primary,
-                            disabledContainerColor = Color.White.copy(alpha = 0.08f)
+                            disabledContainerColor = Color.White.copy(alpha = 0.05f)
                         ),
                         shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.testTag("sync_now_button")
                     ) {
                         if (isSyncing) {
-                            Text("Syncing...")
+                            Text("Deploying...")
                         } else {
-                            Text("Sync Repository")
+                            Text("Sync Now")
                         }
                     }
                 }
@@ -3481,460 +2957,42 @@ fun SyncView(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Background Sync Scheduler Card
-        Card(
-            colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
-            shape = RoundedCornerShape(14.dp),
-            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
+        if (isUniversalRepoEnabled) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondary.copy(alpha = 0.1f)),
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.secondary.copy(alpha = 0.3f))
+            ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text(
-                            text = "AUTOMATED BACKGROUND SYNC",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = Color.LightGray
-                            )
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(
-                                modifier = Modifier
-                                    .size(8.dp)
-                                    .clip(CircleShape)
-                                    .background(if (isBackgroundSyncScheduled) Color(0xFF4CAF50) else Color(0xFFFF9800))
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = if (isBackgroundSyncScheduled) "Active (Every $syncIntervalMinutes mins)" else "Deactivated",
-                                style = MaterialTheme.typography.bodyMedium.copy(
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = if (isBackgroundSyncScheduled) Color(0xFF4CAF50) else Color(0xFFFF9800)
-                                )
-                            )
-                        }
-                    }
-
-                    // Toggle Switch
-                    Switch(
-                        checked = isBackgroundSyncScheduled,
-                        onCheckedChange = { checked ->
-                            if (checked) {
-                                viewModel.scheduleBackgroundSync(syncIntervalMinutes)
-                            } else {
-                                viewModel.cancelBackgroundSync()
-                            }
-                        },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = MaterialTheme.colorScheme.primary,
-                            checkedTrackColor = MaterialTheme.colorScheme.primaryContainer,
-                            uncheckedThumbColor = Color.Gray,
-                            uncheckedTrackColor = Color.White.copy(alpha = 0.1f)
-                        ),
-                        modifier = Modifier.testTag("background_sync_switch")
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(12.dp))
-                HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
-                Spacer(modifier = Modifier.height(12.dp))
-
-                Text(
-                    text = "Sync Frequency Interval",
-                    style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-
-                val intervals = listOf(15, 60, 360, 1440)
-                val labels = listOf("15 mins", "1 hour", "6 hours", "Daily")
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    intervals.forEachIndexed { idx, min ->
-                        val label = labels[idx]
-                        val isSelected = syncIntervalMinutes == min
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.15f) else Color.White.copy(alpha = 0.04f))
-                                .border(
-                                    BorderStroke(1.dp, if (isSelected) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.08f)),
-                                    RoundedCornerShape(8.dp)
-                                )
-                                .clickable {
-                                    viewModel.scheduleBackgroundSync(min)
-                                }
-                                .padding(vertical = 8.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = label,
-                                style = MaterialTheme.typography.bodySmall.copy(
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                    color = if (isSelected) MaterialTheme.colorScheme.primary else Color.LightGray
-                                )
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(14.dp))
-
-                // Standard helper to force execution instantly
-                OutlinedButton(
-                    onClick = { viewModel.testBackgroundSyncImmediately() },
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)),
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("trigger_background_sync_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Refresh,
-                        contentDescription = "Trigger background sync worker",
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Trigger Worker Demonstration",
-                        style = MaterialTheme.typography.labelLarge.copy(color = MaterialTheme.colorScheme.primary)
-                    )
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Secure Cloud Storage Repository Section
-        Card(
-            colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
-            shape = RoundedCornerShape(14.dp),
-            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("cloud_repositories_card")
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text(
-                    text = "SECURE CLOUD STORAGE PROVIDERS",
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = Color.LightGray,
-                        letterSpacing = 1.sp
-                    )
-                )
-                Text(
-                    text = "Configure and link your external staging databases / folders",
-                    style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray)
-                )
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // Google Drive Provider
-                ProviderRow(
-                    name = "Google Drive",
-                    isLinked = googleDriveEmail != null,
-                    email = googleDriveEmail,
-                    folderName = googleDriveFolder,
-                    isPreferred = preferredCloudRepository == "Google Drive",
-                    onLinkClick = { showGoogleLinkDialog = true },
-                    onDisconnectClick = { viewModel.disconnectGoogleDrive() },
-                    onSetPreferredClick = { viewModel.setPreferredCloudRepository("Google Drive") },
-                    accentColor = Color(0xFF34A853),
-                    testTagPrefix = "google_drive"
-                )
-
-                Spacer(modifier = Modifier.height(12.dp))
-                HorizontalDivider(color = Color.White.copy(alpha = 0.06f))
-                Spacer(modifier = Modifier.height(12.dp))
-
-                // Dropbox Provider
-                ProviderRow(
-                    name = "Dropbox Link Node",
-                    isLinked = dropboxEmail != null,
-                    email = dropboxEmail,
-                    folderName = dropboxFolder,
-                    isPreferred = preferredCloudRepository == "Dropbox",
-                    onLinkClick = { showDropboxLinkDialog = true },
-                    onDisconnectClick = { viewModel.disconnectDropbox() },
-                    onSetPreferredClick = { viewModel.setPreferredCloudRepository("Dropbox") },
-                    accentColor = Color(0xFF0061FE),
-                    testTagPrefix = "dropbox"
-                )
-                
-                if (googleDriveEmail == null && dropboxEmail == null) {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFFFEF08A).copy(alpha = 0.08f))
-                            .border(1.dp, Color(0xFFFEF08A).copy(alpha = 0.15f), RoundedCornerShape(8.dp))
-                            .padding(10.dp)
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Warning,
-                                contentDescription = "Security Alert",
-                                tint = Color(0xFFFBBF24),
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Text(
-                                text = "Using isolated offline local storage. Link a cloud provider to unlock background master backups.",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    color = Color(0xFFFEF08A),
-                                    fontSize = 11.sp
-                                )
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Secure Vault Duplicate Scanner Section
-        val duplicateGroups = mediaFiles
-            .filter { it.isDuplicate && !it.md5Hash.isNullOrBlank() }
-            .groupBy { it.md5Hash!! }
-
-        Card(
-            colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
-            shape = RoundedCornerShape(14.dp),
-            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f)),
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("duplicate_detection_card")
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.padding(16.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "SECURE VAULT DUPLICATE SCANNER",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = Color.LightGray,
-                                letterSpacing = 1.sp
-                            )
+                            text = "Universal Repository Consolidation",
+                            style = MaterialTheme.typography.bodyMedium.copy(color = Color.White, fontWeight = FontWeight.Bold)
                         )
                         Text(
-                            text = "Analyze check-sum signatures to clean up redundant copies",
-                            style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray)
+                            text = "Pull shared repository items & config from mirror nodes.",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
                         )
                     }
                     
-                    if (isScanningDuplicates) {
-                        CircularProgressIndicator(
-                            color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(24.dp),
-                            strokeWidth = 2.dp
-                        )
-                    } else {
-                        Button(
-                            onClick = { viewModel.scanForDuplicates() },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
-                                contentColor = MaterialTheme.colorScheme.primary
-                            ),
-                            shape = RoundedCornerShape(8.dp),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                            modifier = Modifier
-                                .height(32.dp)
-                                .testTag("scan_duplicates_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Refresh,
-                                contentDescription = null,
-                                modifier = Modifier.size(14.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "Scan",
-                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                if (duplicateGroups.isEmpty()) {
-                    Box(
+                    IconButton(
+                        onClick = { viewModel.consolidateUniversalRepository() },
+                        enabled = isCloudSyncEnabled && !isSyncing && connectedAccounts.isNotEmpty(),
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF10B981).copy(alpha = 0.08f))
-                            .padding(12.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.secondary)
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.CheckCircle,
-                                contentDescription = "Vault Safe",
-                                tint = Color(0xFF10B981),
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Text(
-                                text = "Your encrypted vault is clean. No duplicated uploads detected.",
-                                style = MaterialTheme.typography.bodySmall.copy(color = Color(0xFF10B981))
-                            )
-                        }
-                    }
-                } else {
-                    Text(
-                        text = "${duplicateGroups.size} Redundant groups flagged for review:",
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color.LightGray.copy(alpha = 0.7f)
-                        ),
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
-
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        duplicateGroups.forEach { (md5, files) ->
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.03f)),
-                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.06f)),
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Column(modifier = Modifier.padding(12.dp)) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            text = "MD5: ${md5.substring(0, kotlin.math.min(md5.length, 12))}...",
-                                            style = MaterialTheme.typography.bodySmall.copy(
-                                                fontFamily = FontFamily.Monospace,
-                                                color = Color.Gray,
-                                                fontSize = 11.sp
-                                            )
-                                        )
-                                        Box(
-                                            modifier = Modifier
-                                                .clip(RoundedCornerShape(4.dp))
-                                                .background(Color(0xFFEF4444).copy(alpha = 0.15f))
-                                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                                        ) {
-                                            Text(
-                                                text = "${files.size} DUPES",
-                                                style = MaterialTheme.typography.labelSmall.copy(
-                                                    color = Color(0xFFF87171),
-                                                    fontWeight = FontWeight.Bold,
-                                                    fontSize = 8.sp
-                                                )
-                                            )
-                                        }
-                                    }
-
-                                    Spacer(modifier = Modifier.height(10.dp))
-
-                                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        files.forEach { file ->
-                                            Row(
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .clip(RoundedCornerShape(6.dp))
-                                                    .background(Color.White.copy(alpha = 0.02f))
-                                                    .padding(8.dp),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Column(modifier = Modifier.weight(1f)) {
-                                                    Text(
-                                                        text = file.fileName,
-                                                        style = MaterialTheme.typography.bodySmall.copy(
-                                                            color = Color.White,
-                                                            fontWeight = FontWeight.Bold
-                                                        ),
-                                                        maxLines = 1,
-                                                        overflow = TextOverflow.Ellipsis
-                                                    )
-                                                    Row(
-                                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                                        verticalAlignment = Alignment.CenterVertically
-                                                    ) {
-                                                        Text(
-                                                            text = "%.1f MB".format(file.fileSize / 1048576f),
-                                                            style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray, fontSize = 10.sp)
-                                                        )
-                                                        Text(
-                                                            text = file.sourceApp,
-                                                            style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray, fontSize = 10.sp)
-                                                        )
-                                                    }
-                                                }
-
-                                                Row(
-                                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                                    verticalAlignment = Alignment.CenterVertically
-                                                ) {
-                                                    // "Keep" button
-                                                    TextButton(
-                                                        onClick = { viewModel.keepDuplicateFile(file) },
-                                                        colors = ButtonDefaults.textButtonColors(
-                                                            contentColor = Color.LightGray.copy(alpha = 0.8f)
-                                                        ),
-                                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                                                        modifier = Modifier
-                                                            .height(28.dp)
-                                                            .testTag("keep_duplicate_${file.id}")
-                                                    ) {
-                                                        Text(
-                                                            text = "Keep Both",
-                                                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp)
-                                                        )
-                                                    }
-
-                                                    // Trash/Delete Button
-                                                    IconButton(
-                                                        onClick = { viewModel.deleteFile(file.id) },
-                                                        modifier = Modifier
-                                                            .size(28.dp)
-                                                            .testTag("delete_duplicate_${file.id}")
-                                                    ) {
-                                                        Icon(
-                                                            imageVector = Icons.Default.Delete,
-                                                            contentDescription = "Delete Duplicate",
-                                                            tint = Color(0xFFEF4444),
-                                                            modifier = Modifier.size(16.dp)
-                                                        )
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        Icon(Icons.Default.Refresh, contentDescription = "Consolidate", tint = Color.White)
                     }
                 }
             }
+            Spacer(modifier = Modifier.height(16.dp))
         }
-
-        Spacer(modifier = Modifier.height(16.dp))
 
         // Terminal Protocol Logs Console
         Text(
@@ -3976,6 +3034,76 @@ fun SyncView(
             }
         }
     }
+
+    if (showAddAccountDialog) {
+        var provider by remember { mutableStateOf("AWS S3") }
+        var name by remember { mutableStateOf("new-mirror-node") }
+        var region by remember { mutableStateOf("us-west-2") }
+        var type by remember { mutableStateOf("Backup") }
+
+        AlertDialog(
+            onDismissRequest = { showAddAccountDialog = false },
+            title = { Text("Link Cloud Mirror Node") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        label = { Text("Account/Node Name") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    
+                    Column {
+                        Text("Provider", style = MaterialTheme.typography.labelSmall)
+                        Row(modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                            listOf("AWS S3", "Azure Blob", "GCP Bucket", "DigitalOcean").forEach { p ->
+                                FilterChip(
+                                    selected = provider == p,
+                                    onClick = { provider = p },
+                                    label = { Text(p) },
+                                    modifier = Modifier.padding(end = 4.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    Column {
+                        Text("Node Type", style = MaterialTheme.typography.labelSmall)
+                        Row(modifier = Modifier.horizontalScroll(rememberScrollState())) {
+                            listOf("Primary", "Backup", "Archive", "DR").forEach { t ->
+                                FilterChip(
+                                    selected = type == t,
+                                    onClick = { type = t },
+                                    label = { Text(t) },
+                                    modifier = Modifier.padding(end = 4.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    OutlinedTextField(
+                        value = region,
+                        onValueChange = { region = it },
+                        label = { Text("Region") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    viewModel.linkAccount(provider, name, region, type)
+                    showAddAccountDialog = false
+                }) {
+                    Text("Link Node")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddAccountDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
 
 @Composable
@@ -3989,28 +3117,29 @@ fun SyncMetricCard(
     Card(
         modifier = modifier,
         colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(12.dp),
         border = BorderStroke(1.dp, Color.White.copy(alpha = 0.1f))
     ) {
-        Column(modifier = Modifier.padding(14.dp)) {
+        Column(modifier = Modifier.padding(10.dp)) {
             Text(
                 text = title,
                 style = MaterialTheme.typography.labelSmall.copy(
                     fontWeight = FontWeight.Bold,
-                    color = tint
+                    color = tint,
+                    fontSize = 9.sp
                 )
             )
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = count,
-                style = MaterialTheme.typography.titleLarge.copy(
+                style = MaterialTheme.typography.titleMedium.copy(
                     fontWeight = FontWeight.Bold,
                     color = Color.White
                 )
             )
             Text(
                 text = description,
-                style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
+                style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray, fontSize = 10.sp)
             )
         }
     }
@@ -4445,7 +3574,7 @@ fun AIOrganizerView(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // AI Agent custom instruction box
+        // AI Agent custom instruction summary box
         Card(
             colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
             shape = RoundedCornerShape(14.dp),
@@ -4453,47 +3582,25 @@ fun AIOrganizerView(
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text(
-                    text = "🧠 CUSTOM CLASSIFICATION RULES For Gemini",
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.secondary
-                    )
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-
-                OutlinedTextField(
-                    value = customRule,
-                    onValueChange = { viewModel.updateCustomRule(it) },
-                    placeholder = {
-                        Text(
-                            "e.g. Put costco in Work, tag screenshots as #captures and move WAV/MP3 recordings to 'Audios'...",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White,
-                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                        unfocusedBorderColor = Color.White.copy(alpha = 0.3f),
-                        focusedPlaceholderColor = Color.Gray,
-                        unfocusedPlaceholderColor = Color.Gray
-                    ),
-                    modifier = Modifier.fillMaxWidth(),
-                    maxLines = 3
-                )
-
-                Spacer(modifier = Modifier.height(12.dp))
-
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "$uncategorizedCount Unorganized files found.",
-                        style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
-                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "🧠 ACTIVE CLASSIFICATION AGENT",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = if (customRule.isBlank()) "Default behavioral logic active." else "Custom ruleset injected.",
+                            style = MaterialTheme.typography.bodySmall.copy(color = Color.Gray)
+                        )
+                    }
 
                     Button(
                         onClick = { viewModel.autoOrganizeAll() },
@@ -4512,6 +3619,30 @@ fun AIOrganizerView(
                         }
                     }
                 }
+                
+                if (customRule.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color.Black.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
+                            .padding(8.dp)
+                    ) {
+                        Text(
+                            text = "\"$customRule\"",
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = Color.LightGray,
+                                fontStyle = FontStyle.Italic
+                            )
+                        )
+                    }
+                }
+                
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "$uncategorizedCount Unorganized files found.",
+                    style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
+                )
             }
         }
 
@@ -4862,24 +3993,6 @@ fun AIOrganizerView(
                 }
             }
         }
-        
-        Spacer(modifier = Modifier.height(16.dp))
-        
-        // Reset Database helper button to satisfy ease-of-use requirements
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.End
-        ) {
-            TextButton(
-                onClick = { viewModel.clearAll() },
-                colors = ButtonDefaults.textButtonColors(contentColor = Color.LightGray),
-                modifier = Modifier.testTag("reset_vault_button")
-            ) {
-                Icon(Icons.Default.Refresh, contentDescription = "Reset database info")
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("Restore Vault Presets")
-            }
-        }
     }
 }
 
@@ -5030,14 +4143,40 @@ fun MediaDetailOverlayModal(
                     contentAlignment = Alignment.Center
                 ) {
                     when (file.fileType) {
-                        "IMAGE" -> {
+                        "IMAGE", "VIDEO" -> {
                             if (!file.localUri.isNullOrEmpty()) {
-                                AsyncImage(
-                                    model = file.localUri,
-                                    contentDescription = "Image preview",
-                                    contentScale = ContentScale.Fit,
-                                    modifier = Modifier.fillMaxSize().padding(8.dp)
-                                )
+                                Box(modifier = Modifier.fillMaxSize()) {
+                                    AsyncImage(
+                                        model = file.localUri,
+                                        contentDescription = "Media preview",
+                                        contentScale = ContentScale.Fit,
+                                        modifier = Modifier.fillMaxSize().padding(8.dp)
+                                    )
+                                    
+                                    if (file.fileType == "VIDEO") {
+                                        Icon(
+                                            imageVector = Icons.Default.PlayArrow,
+                                            contentDescription = "Video",
+                                            tint = Color.White.copy(alpha = 0.9f),
+                                            modifier = Modifier
+                                                .size(64.dp)
+                                                .align(Alignment.Center)
+                                                .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                                                .clickable {
+                                                    try {
+                                                        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                                                            setDataAndType(android.net.Uri.parse(file.localUri!!), "video/*")
+                                                            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                        }
+                                                        context.startActivity(intent)
+                                                    } catch (e: Exception) {
+                                                        Toast.makeText(context, "Playback error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                                    }
+                                                }
+                                                .padding(12.dp)
+                                        )
+                                    }
+                                }
                             } else {
                                 Box(
                                     modifier = Modifier
@@ -5076,8 +4215,8 @@ fun MediaDetailOverlayModal(
                                         verticalArrangement = Arrangement.Center
                                     ) {
                                         Icon(
-                                            imageVector = Icons.Default.Share,
-                                            contentDescription = "Image preview",
+                                            imageVector = if (file.fileType == "IMAGE") Icons.Default.Share else Icons.Default.PlayArrow,
+                                            contentDescription = "Preview placeholder",
                                             tint = MaterialTheme.colorScheme.primary,
                                             modifier = Modifier.size(48.dp)
                                         )
@@ -5091,7 +4230,7 @@ fun MediaDetailOverlayModal(
                                             )
                                         )
                                         Text(
-                                            text = "1920×1080 • PNG • sRGB Grid",
+                                            text = if (file.fileType == "IMAGE") "1920×1080 • PNG • sRGB Grid" else "4K • HEVC • STREAMING READY",
                                             style = MaterialTheme.typography.bodySmall.copy(
                                                 color = Color.DarkGray,
                                                 fontFamily = FontFamily.Monospace,
@@ -5099,82 +4238,6 @@ fun MediaDetailOverlayModal(
                                             )
                                         )
                                     }
-                                }
-                            }
-                        }
-                        "VIDEO" -> {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(16.dp)
-                                    .background(Color.Black, RoundedCornerShape(16.dp)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Column(
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                    verticalArrangement = Arrangement.Center,
-                                    modifier = Modifier.fillMaxSize()
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.PlayArrow,
-                                        contentDescription = "Mock Video Player",
-                                        tint = Color.White,
-                                        modifier = Modifier
-                                            .size(56.dp)
-                                            .background(
-                                                brush = Brush.radialGradient(listOf(Color(0xFF3B82F6), Color.Transparent)),
-                                                shape = CircleShape
-                                            )
-                                            .padding(12.dp)
-                                    )
-                                    Spacer(modifier = Modifier.height(12.dp))
-                                    Text(
-                                        text = "STREAM READY • 60 FPS",
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            color = Color(0xFF60A5FA),
-                                            fontWeight = FontWeight.Bold,
-                                            letterSpacing = 2.sp
-                                        )
-                                    )
-                                }
-                                Row(
-                                    modifier = Modifier
-                                        .align(Alignment.BottomCenter)
-                                        .fillMaxWidth()
-                                        .padding(12.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        "00:43",
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            color = Color.LightGray,
-                                            fontSize = 9.sp,
-                                            fontFamily = FontFamily.Monospace
-                                        )
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Box(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .height(4.dp)
-                                            .background(Color.White.copy(alpha = 0.2f), RoundedCornerShape(2.dp))
-                                    ) {
-                                        Box(
-                                            modifier = Modifier
-                                                .fillMaxWidth(0.35f)
-                                                .height(4.dp)
-                                                .background(Color(0xFF3B82F6), RoundedCornerShape(2.dp))
-                                        )
-                                    }
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        "02:18",
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            color = Color.LightGray,
-                                            fontSize = 9.sp,
-                                            fontFamily = FontFamily.Monospace
-                                        )
-                                    )
                                 }
                             }
                         }
@@ -5565,7 +4628,16 @@ fun MediaDetailOverlayModal(
                             SpecsDetailRow(label = "Precision Size", value = "${file.fileSize} Bytes")
                             val formattedDate = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(file.timestamp))
                             SpecsDetailRow(label = "Indexed Date", value = formattedDate)
-                            SpecsDetailRow(label = "Registry Location", value = file.cloudUrl ?: "PENDING CLOUD SYNC")
+                            
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "MIRROR ENDPOINTS",
+                                style = MaterialTheme.typography.labelSmall.copy(color = Color.Gray, fontWeight = FontWeight.Bold)
+                            )
+                            SpecsDetailRow(label = "Primary", value = if(file.primarySyncStatus == "SYNCED") file.primaryUrl ?: "SECURED" else "PENDING")
+                            SpecsDetailRow(label = "Backup", value = if(file.backupSyncStatus == "SYNCED") file.backupUrl ?: "SECURED" else "PENDING")
+                            SpecsDetailRow(label = "Archive", value = if(file.archiveSyncStatus == "SYNCED") file.archiveUrl ?: "SECURED" else "PENDING")
+                            SpecsDetailRow(label = "Disaster Recovery", value = if(file.disasterRecoverySyncStatus == "SYNCED") file.disasterRecoveryUrl ?: "SECURED" else "PENDING")
                         }
                     }
                 }
@@ -5621,6 +4693,34 @@ fun MediaDetailOverlayModal(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun EmptyVaultState() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 48.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(
+                Icons.Default.Info,
+                contentDescription = "No media files",
+                tint = Color.Gray,
+                modifier = Modifier.size(48.dp)
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = "No files match active filter.",
+                style = MaterialTheme.typography.titleMedium.copy(color = Color.White)
+            )
+            Text(
+                text = "Import actual resources to populate your vault.",
+                style = MaterialTheme.typography.bodySmall.copy(color = Color.LightGray)
+            )
         }
     }
 }
