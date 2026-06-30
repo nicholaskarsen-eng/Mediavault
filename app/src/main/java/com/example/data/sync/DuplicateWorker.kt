@@ -92,15 +92,15 @@ class DuplicateWorker(
             }
         }
         
-        // Metadata Hash fallback: Ensures simulation matches identical metadata uploads perfectly
+        // Metadata Hash fallback: Used if the file cannot be accessed directly (e.g. permission change)
         return try {
             val digest = MessageDigest.getInstance("MD5")
-            // Base hash on same length size and fileName stem
+            // Base hash on size and fileName metadata
             val rawStr = "${file.fileName}:${file.fileSize}:${file.fileType}"
             val md5Bytes = digest.digest(rawStr.toByteArray(Charsets.UTF_8))
             md5Bytes.joinToString("") { "%02x".format(it) }
         } catch (e: Exception) {
-            "sim_hash_${file.fileName.hashCode()}"
+            "err_hash_${file.id}_${file.timestamp}"
         }
     }
 }

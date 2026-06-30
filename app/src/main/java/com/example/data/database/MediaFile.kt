@@ -23,7 +23,13 @@ data class MediaFile(
     val archiveSyncStatus: String = "PENDING",
     val disasterRecoverySyncStatus: String = "PENDING",
     val aiSummary: String? = null,
-    val localUri: String? = null
+    val localUri: String? = null,
+    val md5Hash: String? = null,
+    val isDuplicate: Boolean = false,
+    val isFavorite: Boolean = false,
+    val isDeleted: Boolean = false,
+    val deletedTimestamp: Long? = null,
+    val encryptionStatus: String = "PLAIN" // "PLAIN", "ENCRYPTED_AES256"
 ) {
     val cloudUrl: String? get() = primaryUrl ?: backupUrl ?: archiveUrl ?: disasterRecoveryUrl
 }

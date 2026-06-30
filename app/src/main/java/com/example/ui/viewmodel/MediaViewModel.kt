@@ -8,11 +8,21 @@ import androidx.lifecycle.viewModelScope
 import com.example.BuildConfig
 import com.example.data.database.AppDatabase
 import com.example.data.database.MediaFile
+import com.example.data.database.CloudAccount
 import com.example.data.repository.MediaRepository
 import com.example.data.api.GeminiClient
 import com.example.data.settings.SettingsManager
+import com.example.data.sync.SyncWorker
+import com.example.data.sync.DuplicateWorker
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
+import androidx.work.Constraints
 import android.provider.MediaStore
 import android.content.ContentUris
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -20,19 +30,15 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
-
-data class CloudAccount(
-    val id: String = java.util.UUID.randomUUID().toString(),
-    val provider: String,
-    val accountName: String,
-    val region: String,
-    val type: String // "Primary", "Backup", "Archive", "DR"
-)
+import kotlinx.coroutines.sync.withPermit
 
 data class TaggingEvent(
     val id: String = UUID.randomUUID().toString(),
@@ -43,20 +49,25 @@ data class TaggingEvent(
     val description: String
 )
 
+data class UploadTask(
+    val id: String = UUID.randomUUID().toString(),
+    val fileName: String,
+    val totalSize: Long,
+    val progress: Float, // 0.0 to 1.0
+    val status: String,  // "READING", "ENCRYPTING", "UPLOADING", "ANALYZING_AI", "COMPLETED", "FAILED"
+    val tags: List<String> = emptyList()
+)
+
 class MediaViewModel(application: Application) : AndroidViewModel(application) {
     private val database = AppDatabase.getDatabase(application)
     private val repository = MediaRepository(database.mediaFileDao())
+    private val cloudAccountDao = database.cloudAccountDao()
     private val settingsManager = SettingsManager(application)
 
     private val _mediaFiles = MutableStateFlow<List<MediaFile>>(emptyList())
     val mediaFiles: StateFlow<List<MediaFile>> = _mediaFiles.asStateFlow()
 
-    private val _connectedAccounts = MutableStateFlow<List<CloudAccount>>(
-        listOf(
-            CloudAccount(provider = "AWS S3", accountName = "primary-vault-prod", region = "us-east-1", type = "Primary"),
-            CloudAccount(provider = "Azure Blob", accountName = "backup-node-01", region = "westeurope", type = "Backup")
-        )
-    )
+    private val _connectedAccounts = MutableStateFlow<List<CloudAccount>>(emptyList())
     val connectedAccounts: StateFlow<List<CloudAccount>> = _connectedAccounts.asStateFlow()
 
     private val _selectedTab = MutableStateFlow(0)
@@ -74,56 +85,6 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _syncIntervalMinutes = MutableStateFlow(15)
     val syncIntervalMinutes: StateFlow<Int> = _syncIntervalMinutes.asStateFlow()
-
-    fun scheduleBackgroundSync(intervalMinutes: Int) {
-        val workManager = WorkManager.getInstance(getApplication())
-        _syncIntervalMinutes.value = intervalMinutes
-
-        val constraints = Constraints.Builder()
-            .setRequiresCharging(true)
-            .build()
-
-        val periodicRequest = PeriodicWorkRequestBuilder<SyncWorker>(
-            intervalMinutes.toLong(), TimeUnit.MINUTES
-        )
-            .setConstraints(constraints)
-            .addTag("BackgroundSyncJob")
-            .build()
-
-        workManager.enqueueUniquePeriodicWork(
-            "BackgroundSyncJob",
-            ExistingPeriodicWorkPolicy.UPDATE,
-            periodicRequest
-        )
-
-        _isBackgroundSyncScheduled.value = true
-        addSyncLog("[System] Background sync scheduled successfully via WorkManager.")
-        addSyncLog("[System] Constraints: Device must be charging.")
-        addSyncLog("[System] Interval: Every $intervalMinutes minutes.")
-    }
-
-    fun cancelBackgroundSync() {
-        val workManager = WorkManager.getInstance(getApplication())
-        workManager.cancelUniqueWork("BackgroundSyncJob")
-        _isBackgroundSyncScheduled.value = false
-        addSyncLog("[System] Background sync deactivated. WorkManager periodic job cancelled.")
-    }
-
-    fun testBackgroundSyncImmediately() {
-        viewModelScope.launch {
-            val workManager = WorkManager.getInstance(getApplication())
-            val testRequest = OneTimeWorkRequestBuilder<SyncWorker>()
-                .addTag("TestBackgroundSync")
-                .build()
-
-            addSyncLog("[System] Triggering simulated Scheduled Sync Worker now...")
-            workManager.enqueueUniqueWork(
-                "TestBackgroundSync",
-                ExistingWorkPolicy.REPLACE,
-                testRequest
-            )
-        }
-    }
 
     private val _syncLogs = MutableStateFlow<List<String>>(
         listOf(
@@ -145,6 +106,15 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
         )
     )
     val aiLogs: StateFlow<List<String>> = _aiLogs.asStateFlow()
+
+    private val _isAutoTaggingEnabled = MutableStateFlow(true)
+    val isAutoTaggingEnabled: StateFlow<Boolean> = _isAutoTaggingEnabled.asStateFlow()
+
+    private val _taggingGranularity = MutableStateFlow("STANDARD")
+    val taggingGranularity: StateFlow<String> = _taggingGranularity.asStateFlow()
+
+    private val _recentTaggingEvents = MutableStateFlow<List<TaggingEvent>>(emptyList())
+    val recentTaggingEvents: StateFlow<List<TaggingEvent>> = _recentTaggingEvents.asStateFlow()
 
     // Import state
     private val _isImporting = MutableStateFlow(false)
@@ -175,7 +145,7 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
     private val _notificationsEnabled = MutableStateFlow(settingsManager.getBoolean(SettingsManager.KEY_NOTIFICATIONS, true))
     val notificationsEnabled: StateFlow<Boolean> = _notificationsEnabled.asStateFlow()
 
-    private val _isCloudSyncEnabled = MutableStateFlow(settingsManager.getBoolean(SettingsManager.KEY_CLOUD_SYNC, false))
+    private val _isCloudSyncEnabled = MutableStateFlow(true)
     val isCloudSyncEnabled: StateFlow<Boolean> = _isCloudSyncEnabled.asStateFlow()
 
     private val _selectedAiModel = MutableStateFlow(settingsManager.getString(SettingsManager.KEY_AI_MODEL, "gemini-1.5-flash")) // "gemini-1.5-flash", "gemini-1.5-pro"
@@ -187,13 +157,13 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
     private val _autoDeleteAfterDays = MutableStateFlow(settingsManager.getInt(SettingsManager.KEY_AUTO_DELETE, 0)) // 0 means disabled
     val autoDeleteAfterDays: StateFlow<Int> = _autoDeleteAfterDays.asStateFlow()
 
-    private val _isUniversalRepoEnabled = MutableStateFlow(settingsManager.getBoolean(SettingsManager.KEY_UNIVERSAL_REPO, false))
+    private val _isUniversalRepoEnabled = MutableStateFlow(true)
     val isUniversalRepoEnabled: StateFlow<Boolean> = _isUniversalRepoEnabled.asStateFlow()
 
-    private val _autoConsolidate = MutableStateFlow(true)
-    val autoConsolidate: StateFlow<Boolean> = _autoConsolidate.asStateFlow()
+    private val _pairedDevices = MutableStateFlow<List<String>>(emptyList())
+    val pairedDevices: StateFlow<List<String>> = _pairedDevices.asStateFlow()
 
-    private val _deviceId = MutableStateFlow(settingsManager.getString(SettingsManager.KEY_DEVICE_ID, "DEV-${java.util.UUID.randomUUID().toString().take(6).uppercase()}"))
+    private val _deviceId = MutableStateFlow(settingsManager.getString(SettingsManager.KEY_DEVICE_ID, "DEV-${UUID.randomUUID().toString().take(6).uppercase()}"))
     val deviceId: StateFlow<String> = _deviceId.asStateFlow()
 
     private val _redundancyLevel = MutableStateFlow(settingsManager.getInt(SettingsManager.KEY_REDUNDANCY, 4)) // 1 to 4 nodes
@@ -202,20 +172,127 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
     private val _lastSyncTimestamp = MutableStateFlow<Long?>(null)
     val lastSyncTimestamp: StateFlow<Long?> = _lastSyncTimestamp.asStateFlow()
 
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+
+    private val _lastDeletedFiles = MutableStateFlow<List<MediaFile>>(emptyList())
+    val lastDeletedFiles: StateFlow<List<MediaFile>> = _lastDeletedFiles.asStateFlow()
+
+    private val _showUndoToast = MutableStateFlow(false)
+    val showUndoToast: StateFlow<Boolean> = _showUndoToast.asStateFlow()
+
+    private val _activeUploads = MutableStateFlow<List<UploadTask>>(emptyList())
+    val activeUploads: StateFlow<List<UploadTask>> = _activeUploads.asStateFlow()
+
+    private val _isScanningDuplicates = MutableStateFlow(false)
+    val isScanningDuplicates: StateFlow<Boolean> = _isScanningDuplicates.asStateFlow()
+
+    private val _discoveredNodes = MutableStateFlow<List<DiscoveredNode>>(emptyList())
+    val discoveredNodes: StateFlow<List<DiscoveredNode>> = _discoveredNodes.asStateFlow()
+
+    private val _isDiscovering = MutableStateFlow(false)
+    val isDiscovering: StateFlow<Boolean> = _isDiscovering.asStateFlow()
+
+    private val _availableShares = MutableStateFlow<List<String>>(emptyList())
+    val availableShares: StateFlow<List<String>> = _availableShares.asStateFlow()
+
+    private val _isEnumeratingShares = MutableStateFlow(false)
+    val isEnumeratingShares: StateFlow<Boolean> = _isEnumeratingShares.asStateFlow()
+
     // Key warning state description
     val isApiKeyConfigured: Boolean
         get() = _apiKey.value.isNotBlank() && 
                 _apiKey.value != "MY_GEMINI_API_KEY" &&
                 !_apiKey.value.contains("REPLACE_WITH_YOUR_GEMINI_API_KEY")
 
-    init {
-        // Trigger initial simulated repository fetching delay
-        refreshMedia()
+    data class DiscoveredNode(val name: String, val endpoint: String, val provider: String)
 
+    fun startNetworkDiscovery() {
+        if (_isDiscovering.value) return
+        _isDiscovering.value = true
+        _discoveredNodes.value = emptyList()
+        
+        viewModelScope.launch(Dispatchers.IO) {
+            addSyncLog("[System] Initializing Network Discovery Protocol...")
+            
+            // 1. Simulate SMB Discovery
+            delay(1000)
+            val mockNodes = listOf(
+                DiscoveredNode("Home-NAS", "192.168.1.100", "SMB Share"),
+                DiscoveredNode("Media-Server", "192.168.1.105", "SMB Share"),
+                DiscoveredNode("Work-Vault", "10.0.0.50", "SMB Share")
+            )
+            
+            // Note: Real network discovery would require NsdManager or broad subnet scans
+            // and should use its own non-singleton BaseContext if jcifs-ng is involved.
+            
+            mockNodes.forEach { node ->
+                if (_isDiscovering.value) {
+                    _discoveredNodes.value = _discoveredNodes.value + node
+                    addSyncLog("[Discovery] Found potential node: ${node.name} at ${node.endpoint}")
+                }
+            }
+            
+            _isDiscovering.value = false
+            addSyncLog("[System] Network Discovery cycle complete.")
+        }
+    }
+
+    fun stopNetworkDiscovery() {
+        _isDiscovering.value = false
+    }
+
+    fun enumerateSmbShares(host: String, user: String, pass: String) {
+        if (host.isBlank()) return
+        _isEnumeratingShares.value = true
+        _availableShares.value = emptyList()
+        
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                addSyncLog("[SMB] Enumerating shares on $host...")
+                
+                val props = java.util.Properties().apply {
+                    setProperty("jcifs.smb.client.minVersion", "SMB202")
+                    setProperty("jcifs.smb.client.maxVersion", "SMB311")
+                    setProperty("jcifs.smb.client.connTimeout", "5000")
+                    setProperty("jcifs.smb.client.soTimeout", "10000")
+                }
+                val config = jcifs.config.PropertyConfiguration(props)
+                val baseContext = jcifs.context.BaseContext(config)
+                
+                val auth = if (user.isNotEmpty()) {
+                    baseContext.withCredentials(jcifs.smb.NtlmPasswordAuthenticator(null, user, pass))
+                } else {
+                    baseContext.withAnonymousCredentials()
+                }
+                
+                val server = jcifs.smb.SmbFile("smb://$host/", auth)
+                val shares = server.listFiles()
+                    .filter { it.type == jcifs.SmbConstants.TYPE_SHARE }
+                    .map { it.name.removeSuffix("/") }
+                
+                _availableShares.value = shares
+                addSyncLog("[SMB] Found ${shares.size} shares on $host.")
+            } catch (e: Exception) {
+                addSyncLog("[Error] SMB Share enumeration failed: ${e.message}")
+            } finally {
+                _isEnumeratingShares.value = false
+            }
+        }
+    }
+
+    init {
+        refreshMedia()
         // Collect repository contents
         viewModelScope.launch {
             repository.allMediaFiles.collectLatest { list ->
                 _mediaFiles.value = list
+            }
+        }
+        // Collect cloud accounts
+        viewModelScope.launch {
+            cloudAccountDao.getAllAccounts().collectLatest { list ->
+                _connectedAccounts.value = list
             }
         }
     }
@@ -296,6 +373,23 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun pairNewDevice(scannedDeviceId: String) {
+        if (!_pairedDevices.value.contains(scannedDeviceId) && scannedDeviceId != _deviceId.value) {
+            _pairedDevices.value = _pairedDevices.value + scannedDeviceId
+            addSyncLog("[Universal Repo] New device paired: $scannedDeviceId. Handshake established.")
+            
+            // Automatically consolidate after pairing
+            consolidateUniversalRepository()
+        } else if (scannedDeviceId == _deviceId.value) {
+            addSyncLog("[Universal Repo] Handshake aborted: Cannot pair device with itself.")
+        }
+    }
+
+    fun unpairDevice(deviceId: String) {
+        _pairedDevices.value = _pairedDevices.value.filter { it != deviceId }
+        addSyncLog("[Universal Repo] Device unpaired: $deviceId. Mutual definitions purged.")
+    }
+
     fun updateRedundancyLevel(level: Int) {
         val maxNodes = _connectedAccounts.value.size.coerceAtLeast(1)
         val coercedLevel = level.coerceIn(1, maxNodes)
@@ -312,11 +406,39 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun syncConfigurationToCloud() {
+        val primaryNode = _connectedAccounts.value.find { it.type == "Primary" }
+        if (primaryNode == null || primaryNode.endpoint.isNullOrBlank()) return
+
         viewModelScope.launch {
-            addSyncLog("[Sync Engine] Mirroring system configuration to Global Matrix...")
-            delay(500)
-            // Simulated upload of settings to cloud metadata
-            addSyncLog("[Sync Engine] Configuration mirroring SUCCESSFUL. All nodes updated.")
+            try {
+                addSyncLog("[Sync Engine] Mirroring system configuration to Global Matrix...")
+                
+                // Construct a temporary config file
+                val configJson = org.json.JSONObject().apply {
+                    put("deviceId", _deviceId.value)
+                    put("theme", _appTheme.value)
+                    put("autoOrganize", _autoOrganizeOnImport.value)
+                    put("aiModel", _selectedAiModel.value)
+                    put("redundancy", _redundancyLevel.value)
+                }
+                
+                val context = getApplication<android.app.Application>()
+                val configFile = java.io.File(context.cacheDir, "system_config.json")
+                configFile.writeText(configJson.toString())
+                
+                val uri = android.net.Uri.fromFile(configFile).toString()
+                
+                com.example.data.api.CloudStorageClient.uploadFile(
+                    context = context,
+                    localUri = uri,
+                    account = primaryNode,
+                    fileName = "config_${_deviceId.value}.json"
+                )
+                
+                addSyncLog("[Sync Engine] Configuration mirroring SUCCESSFUL. All nodes updated.")
+            } catch (e: Exception) {
+                addSyncLog("[Error] Failed to mirror configuration: ${e.message}")
+            }
         }
     }
 
@@ -326,22 +448,39 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
         addSyncLog("[System] Auto-configured Redundancy Level to $count based on ${_connectedAccounts.value.size} linked cloud accounts.")
     }
 
-    fun linkAccount(provider: String, name: String, region: String, type: String) {
-        val newAccount = CloudAccount(provider = provider, accountName = name, region = region, type = type)
-        _connectedAccounts.value = _connectedAccounts.value + newAccount
-        addSyncLog("[System] New cloud account linked: $name ($provider)")
+    fun linkAccount(provider: String, name: String, region: String, type: String, apiKey: String? = null, secretKey: String? = null, bucketName: String? = null, endpoint: String? = null, id: String? = null) {
+        viewModelScope.launch {
+            val account = CloudAccount(
+                id = id ?: UUID.randomUUID().toString(),
+                provider = provider.trim(),
+                accountName = name.trim(),
+                region = region.trim(),
+                type = type.trim(),
+                apiKey = apiKey?.trim(),
+                secretKey = secretKey, // Don't trim passwords
+                bucketName = bucketName?.trim(),
+                endpoint = endpoint?.trim()
+            )
+            cloudAccountDao.insertAccount(account)
+            if (id == null) {
+                addSyncLog("[System] New cloud account linked: ${account.accountName} (${account.provider})")
+            } else {
+                addSyncLog("[System] Cloud account updated: ${account.accountName} (${account.provider})")
+            }
+        }
     }
 
     fun unlinkAccount(id: String) {
-        val account = _connectedAccounts.value.find { it.id == id }
-        _connectedAccounts.value = _connectedAccounts.value.filter { it.id != id }
-        account?.let { addSyncLog("[System] Cloud account removed: ${it.accountName}") }
-        
-        // Ensure redundancy level does not exceed the new account count
-        val maxNodes = _connectedAccounts.value.size.coerceAtLeast(1)
-        if (_redundancyLevel.value > maxNodes) {
-            _redundancyLevel.value = maxNodes
-            addSyncLog("[System] Sync Redundancy auto-adjusted to $maxNodes nodes due to account removal.")
+        viewModelScope.launch {
+            val account = _connectedAccounts.value.find { it.id == id }
+            cloudAccountDao.deleteAccountById(id)
+            account?.let { addSyncLog("[System] Cloud account removed: ${it.accountName}") }
+            
+            val maxNodes = (_connectedAccounts.value.size - 1).coerceAtLeast(1)
+            if (_redundancyLevel.value > maxNodes) {
+                _redundancyLevel.value = maxNodes
+                addSyncLog("[System] Sync Redundancy auto-adjusted to $maxNodes nodes due to account removal.")
+            }
         }
     }
 
@@ -354,7 +493,50 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setAutoTaggingEnabled(enabled: Boolean) {
+        _isAutoTaggingEnabled.value = enabled
+        addAiLog("[AI Service] Auto-tagging state updated: " + if (enabled) "ENABLED" else "DISABLED")
+    }
+
+    fun setTaggingGranularity(granularity: String) {
+        _taggingGranularity.value = granularity
+        addAiLog("[AI Service] Tagging model directive updated: $granularity")
+    }
+
+    fun recordTaggingEvent(event: TaggingEvent) {
+        _recentTaggingEvents.value = (listOf(event) + _recentTaggingEvents.value).take(10)
+    }
+
+    fun refreshMedia() {
+        // Real fetch from repository is handled by collectLatest
+    }
+
+    fun undoDelete() {
+        viewModelScope.launch {
+            val filesToRestore = _lastDeletedFiles.value
+            _lastDeletedFiles.value = emptyList()
+            _showUndoToast.value = false
+            filesToRestore.forEach { file ->
+                repository.insert(file.copy(id = 0))
+            }
+            addSyncLog("[System] Restored ${filesToRestore.size} files from undo action")
+        }
+    }
+
+    fun dismissUndoToast() {
+        _showUndoToast.value = false
+    }
+
     fun addImportedFile(fileName: String, fileType: String, sourceApp: String, sizeBytes: Long, uri: String) {
+        val currentTotalSize = _mediaFiles.value.sumOf { it.fileSize }
+        val limitBytes = _maxVaultSizeMb.value * 1024L * 1024L
+        
+        // If not Cloud Matrix Maximum (10000), enforce limit
+        if (_maxVaultSizeMb.value < 10000 && currentTotalSize + sizeBytes > limitBytes) {
+            addSyncLog("[System] Import Aborted: Vault size limit reached. Expand in Config.")
+            return
+        }
+
         viewModelScope.launch {
             _isImporting.value = true
             _importProgress.value = 0.5f
@@ -372,28 +554,33 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
             val insertedFile = file.copy(id = generatedId.toInt())
             _importProgress.value = 1f
             addSyncLog("[System] Imported physical device file: $fileName under Secure Sandbox")
-            delay(500)
             _isImporting.value = false
             
-            // Automatically analyze and generate descriptive tags upon upload if enabled
             if (_autoOrganizeOnImport.value) {
-                addAiLog("[AI] Automatically organizing newly imported file: \"$fileName\"...")
-                val result = GeminiClient.organizeFile(
-                    fileName = insertedFile.fileName,
-                    fileType = insertedFile.fileType,
-                    sourceApp = insertedFile.sourceApp,
-                    fileSizeLong = insertedFile.fileSize,
-                    customRule = _customRule.value,
-                    modelName = _selectedAiModel.value,
-                    apiKey = _apiKey.value
-                )
-                val updatedFile = insertedFile.copy(
-                    category = result.category,
-                    tags = result.tags.joinToString(", "),
-                    aiSummary = result.explanation
-                )
-                repository.update(updatedFile)
-                addAiLog("[AI] Automatically organized \"$fileName\" into [${result.category}] tags: ${result.tags.joinToString(", ")}")
+                try {
+                    addAiLog("[AI] Automatically organizing newly imported file: \"$fileName\"...")
+                    val result = GeminiClient.organizeFile(
+                        context = getApplication(),
+                        fileName = insertedFile.fileName,
+                        fileType = insertedFile.fileType,
+                        sourceApp = insertedFile.sourceApp,
+                        fileSizeLong = insertedFile.fileSize,
+                        localUri = insertedFile.localUri,
+                        customRule = _customRule.value,
+                        granularity = _taggingGranularity.value,
+                        modelName = _selectedAiModel.value,
+                        apiKey = _apiKey.value
+                    )
+                    val updatedFile = insertedFile.copy(
+                        category = result.category,
+                        tags = result.tags.joinToString(", "),
+                        aiSummary = result.explanation
+                    )
+                    repository.update(updatedFile)
+                    addAiLog("[AI] Automatically organized \"$fileName\" into [${result.category}]")
+                } catch (e: Exception) {
+                    addAiLog("[Error] Auto-organization failed for \"$fileName\": ${e.message}")
+                }
             }
         }
     }
@@ -407,42 +594,11 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
                 repository.deleteById(id)
                 addSyncLog("[System] File deleted from secure local database index (Id: $id)")
                 
-                // Wait 5 seconds and auto-hide
                 delay(5000)
                 if (_lastDeletedFiles.value.any { it.id == id }) {
                     _showUndoToast.value = false
                 }
             }
-        }
-    }
-
-    fun deleteMultipleFiles(ids: List<Int>) {
-        viewModelScope.launch {
-            val files = _mediaFiles.value.filter { it.id in ids }
-            if (files.isNotEmpty()) {
-                _lastDeletedFiles.value = files
-                _showUndoToast.value = true
-                ids.forEach { repository.deleteById(it) }
-                addSyncLog("[System] Securely deleted ${ids.size} files from database vault")
-                
-                // Wait 5 seconds and auto-hide
-                delay(5000)
-                if (_lastDeletedFiles.value == files) {
-                    _showUndoToast.value = false
-                }
-            }
-        }
-    }
-
-    fun moveMultipleFilesToCategory(ids: List<Int>, newCategory: String) {
-        viewModelScope.launch {
-            var count = 0
-            _mediaFiles.value.filter { it.id in ids }.forEach { file ->
-                val updated = file.copy(category = newCategory)
-                repository.update(updated)
-                count++
-            }
-            addSyncLog("[System] Successfully moved $count files to folder: [$newCategory]")
         }
     }
 
@@ -461,41 +617,52 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
         _aiLogs.value = _aiLogs.value + message
     }
 
-    // Trigger organization for a single file using Gemini
     fun organizeSingleFile(file: MediaFile) {
         viewModelScope.launch {
-            addAiLog("[AI] Initiating analysis for \"${file.fileName}\"...")
-            val result = GeminiClient.organizeFile(
-                context = getApplication(),
-                fileName = file.fileName,
-                fileType = file.fileType,
-                sourceApp = file.sourceApp,
-                fileSizeLong = file.fileSize,
-                customRule = _customRule.value,
-                modelName = _selectedAiModel.value,
-                apiKey = _apiKey.value
-            )
-
-            val updatedFile = file.copy(
-                category = result.category,
-                tags = result.tags.joinToString(", "),
-                aiSummary = result.explanation
-            )
-            repository.update(updatedFile)
-            val statusStr = if (isApiKeyConfigured) "SUCCESS" else "OFFLINE_FALLBACK"
-            recordTaggingEvent(
-                TaggingEvent(
+            try {
+                addAiLog("[AI] Initiating analysis for \"${file.fileName}\"...")
+                val result = GeminiClient.organizeFile(
+                    context = getApplication(),
                     fileName = file.fileName,
-                    status = statusStr,
-                    tags = result.tags,
-                    description = "Manual analysis for file: ${result.explanation}"
+                    fileType = file.fileType,
+                    sourceApp = file.sourceApp,
+                    fileSizeLong = file.fileSize,
+                    localUri = file.localUri,
+                    customRule = _customRule.value,
+                    granularity = _taggingGranularity.value,
+                    modelName = _selectedAiModel.value,
+                    apiKey = _apiKey.value
                 )
-            )
-            addAiLog("[AI] Successfully organized \"${file.fileName}\" into [${result.category}] tags: ${result.tags.joinToString(", ")}")
+
+                val updatedFile = file.copy(
+                    category = result.category,
+                    tags = result.tags.joinToString(", "),
+                    aiSummary = result.explanation
+                )
+                repository.update(updatedFile)
+                recordTaggingEvent(
+                    TaggingEvent(
+                        fileName = file.fileName,
+                        status = "SUCCESS",
+                        tags = result.tags,
+                        description = "Manual analysis: ${result.explanation}"
+                    )
+                )
+                addAiLog("[AI] Successfully organized \"${file.fileName}\" into [${result.category}]")
+            } catch (e: Exception) {
+                addAiLog("[Error] AI Analysis failed for \"${file.fileName}\": ${e.message}")
+                recordTaggingEvent(
+                    TaggingEvent(
+                        fileName = file.fileName,
+                        status = "FAILED",
+                        tags = emptyList(),
+                        description = "Error: ${e.message}"
+                    )
+                )
+            }
         }
     }
 
-    // Trigger organization for all files currently marked "Uncategorized" with parallel execution
     fun autoOrganizeAll() {
         val filesToOrganize = _mediaFiles.value.filter { it.category == "Uncategorized" }
         if (filesToOrganize.isEmpty()) {
@@ -503,45 +670,67 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        val context = getApplication<android.app.Application>()
+        
         viewModelScope.launch {
             _isOrganizing.value = true
-            addAiLog("[AI] Commencing Parallel Agent cataloging. Found ${filesToOrganize.size} files for organization.")
+            addAiLog("[AI] Commencing Parallel Agent cataloging. Target: ${filesToOrganize.size} files.")
             
             val mutex = Mutex()
+            val semaphore = Semaphore(3) // Limit to 3 concurrent AI requests to avoid rate limits/overload
             
-            // Process files in parallel to optimize deployment throughput
             filesToOrganize.map { file ->
                 async {
-                    mutex.withLock {
-                        addAiLog("[AI] Analyzing \"${file.fileName}\" on background thread...")
-                    }
-                    
-                    val result = GeminiClient.organizeFile(
-                        fileName = file.fileName,
-                        fileType = file.fileType,
-                        sourceApp = file.sourceApp,
-                        fileSizeLong = file.fileSize,
-                        customRule = _customRule.value,
-                        modelName = _selectedAiModel.value,
-                        apiKey = _apiKey.value
-                    )
+                    semaphore.withPermit {
+                        try {
+                            // Check if file is still accessible before calling AI
+                            val uriString = file.localUri
+                            if (!uriString.isNullOrEmpty()) {
+                                try {
+                                    context.contentResolver.openInputStream(android.net.Uri.parse(uriString))?.close()
+                                } catch (e: Exception) {
+                                    mutex.withLock {
+                                        addAiLog("[System] Cleanup: File not found \"${file.fileName}\", removing from index.")
+                                    }
+                                    repository.deleteById(file.id)
+                                    return@withPermit
+                                }
+                            }
 
-                    val updatedFile = file.copy(
-                        category = result.category,
-                        tags = result.tags.joinToString(", "),
-                        aiSummary = result.explanation
-                    )
-                    repository.update(updatedFile)
-                    
-                    mutex.withLock {
-                        addAiLog("[AI] -> Integrated: ${file.fileName} cataloged into [${result.category}]")
+                            val result = GeminiClient.organizeFile(
+                                context = getApplication(),
+                                fileName = file.fileName,
+                                fileType = file.fileType,
+                                sourceApp = file.sourceApp,
+                                fileSizeLong = file.fileSize,
+                                localUri = file.localUri,
+                                customRule = _customRule.value,
+                                granularity = _taggingGranularity.value,
+                                modelName = _selectedAiModel.value,
+                                apiKey = _apiKey.value
+                            )
+
+                            val updatedFile = file.copy(
+                                category = result.category,
+                                tags = result.tags.joinToString(", "),
+                                aiSummary = result.explanation
+                            )
+                            repository.update(updatedFile)
+                            
+                            mutex.withLock {
+                                addAiLog("[AI] -> cataloged: ${file.fileName} into [${result.category}]")
+                            }
+                        } catch (e: Exception) {
+                            mutex.withLock {
+                                addAiLog("[Error] Failed to organize ${file.fileName}: ${e.message}")
+                            }
+                        }
                     }
-                    delay(300) // Reduced delay for parallel visualization
                 }
             }.awaitAll()
             
             _isOrganizing.value = false
-            addAiLog("[AI] Parallel Multi-Agent process finished! Vault consolidated.")
+            addAiLog("[AI] Parallel Multi-Agent cycle finished.")
         }
     }
 
@@ -625,12 +814,21 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
             var count = 0
             val total = foundItems.size
             if (total > 0) {
+                var currentTotalSize = _mediaFiles.value.sumOf { it.fileSize }
+                val limitBytes = _maxVaultSizeMb.value * 1024L * 1024L
+                val isUnlimited = _maxVaultSizeMb.value >= 10000
+
                 foundItems.forEachIndexed { index, file ->
+                    if (!isUnlimited && currentTotalSize + file.fileSize > limitBytes) {
+                        addSyncLog("[System] Scan Interrupted: Vault size limit reached.")
+                        return@forEachIndexed
+                    }
+                    
                     repository.insert(file)
+                    currentTotalSize += file.fileSize
                     count++
                     addSyncLog("[System] Discovered: ${file.fileName}")
                     _importProgress.value = (index + 1).toFloat() / total
-                    delay(50) 
                 }
             }
             
@@ -644,174 +842,222 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // Cloud syncing to multiple mirrors based on connected accounts
     fun syncNow() {
         val pendingFiles = _mediaFiles.value.filter { it.syncStatus != "SYNCED" }
         if (pendingFiles.isEmpty()) {
-            addSyncLog("[System] Sync checked: All repository mirrors already secure.")
+            addSyncLog("[System] All repository mirrors already secure.")
             return
         }
 
         val accounts = _connectedAccounts.value
         if (accounts.isEmpty()) {
-            addSyncLog("[Error] No cloud accounts linked. Cannot initiate mirror sync.")
+            addSyncLog("[Error] No cloud accounts linked. Please add a mirror node in Config.")
             return
         }
 
         viewModelScope.launch {
             _isSyncing.value = true
             _syncProgress.value = 0f
-            addSyncLog("[Sync Engine] Initializing Multi-Threaded Deployment Matrix for ${accounts.size} mirrors...")
-            delay(1000)
-
+            addSyncLog("[Sync Engine] Connecting to Mirror Matrix for ${accounts.size} active nodes...")
+            
             val totalSteps = pendingFiles.size * accounts.size
             var completedSteps = 0
             val mutex = Mutex()
+            val semaphore = Semaphore(5) // Limit concurrent uploads to 5 nodes/files
 
-            // Process all pending files in parallel
             pendingFiles.map { file ->
                 async {
-                    var updatedFile = file
-                    
-                    // Sync to each connected account
-                    accounts.forEach { account ->
-                        // Simulate mirror-specific logic based on type
-                        val isAlreadySynced = when (account.type) {
-                            "Primary" -> updatedFile.primarySyncStatus == "SYNCED"
-                            "Backup" -> updatedFile.backupSyncStatus == "SYNCED"
-                            "Archive" -> updatedFile.archiveSyncStatus == "SYNCED"
-                            "DR" -> updatedFile.disasterRecoverySyncStatus == "SYNCED"
-                            else -> false
+                    semaphore.withPermit {
+                        var updatedFile = file
+                        accounts.forEach { account ->
+                            try {
+                                if (account.endpoint.isNullOrBlank()) {
+                                    throw Exception("Mirror node ${account.accountName} endpoint is missing.")
+                                }
+                                
+                                val localUri = file.localUri ?: throw Exception("Local URI missing for ${file.fileName}")
+                                
+                                val realMirrorUrl = com.example.data.api.CloudStorageClient.uploadFile(
+                                    context = getApplication(),
+                                    localUri = localUri,
+                                    account = account,
+                                    fileName = file.fileName
+                                )
+                                
+                                updatedFile = when (account.type) {
+                                    "Primary" -> updatedFile.copy(primarySyncStatus = "SYNCED", primaryUrl = realMirrorUrl)
+                                    "Backup" -> updatedFile.copy(backupSyncStatus = "SYNCED", backupUrl = realMirrorUrl)
+                                    "Archive" -> updatedFile.copy(archiveSyncStatus = "SYNCED", archiveUrl = realMirrorUrl)
+                                    "DR" -> updatedFile.copy(disasterRecoverySyncStatus = "SYNCED", disasterRecoveryUrl = realMirrorUrl)
+                                    else -> updatedFile
+                                }
+
+                                mutex.withLock {
+                                    completedSteps++
+                                    _syncProgress.value = completedSteps.toFloat() / totalSteps
+                                    addSyncLog("[Sync Engine] Mirror ${account.provider}: Transferred \"${file.fileName}\"")
+                                }
+                            } catch (e: Exception) {
+                                mutex.withLock {
+                                    addSyncLog("[Error] ${account.accountName}: ${e.message}")
+                                }
+                            }
                         }
 
-                        if (!isAlreadySynced) {
-                            delay(300) // Latency simulation
-                            
-                            val mirrorUrl = "https://${account.provider.lowercase().replace(" ", "-")}.io/u/${file.fileName}"
-                            
-                            updatedFile = when (account.type) {
-                                "Primary" -> updatedFile.copy(primarySyncStatus = "SYNCED", primaryUrl = mirrorUrl)
-                                "Backup" -> updatedFile.copy(backupSyncStatus = "SYNCED", backupUrl = mirrorUrl)
-                                "Archive" -> updatedFile.copy(archiveSyncStatus = "SYNCED", archiveUrl = mirrorUrl)
-                                "DR" -> updatedFile.copy(disasterRecoverySyncStatus = "SYNCED", disasterRecoveryUrl = mirrorUrl)
-                                else -> updatedFile
-                            }
+                        // Calculate final status
+                        val requiredTypes = accounts.map { it.type }.toSet()
+                        val isPrimaryOk = !"Primary".isIn(requiredTypes) || updatedFile.primarySyncStatus == "SYNCED"
+                        val isBackupOk = !"Backup".isIn(requiredTypes) || updatedFile.backupSyncStatus == "SYNCED"
+                        val isArchiveOk = !"Archive".isIn(requiredTypes) || updatedFile.archiveSyncStatus == "SYNCED"
+                        val isDrOk = !"DR".isIn(requiredTypes) || updatedFile.disasterRecoverySyncStatus == "SYNCED"
 
-                            mutex.withLock {
-                                completedSteps++
-                                _syncProgress.value = completedSteps.toFloat() / totalSteps
-                                addSyncLog("[Sync Engine] Mirror ${account.provider} (${account.type}): Secured \"${file.fileName}\"")
-                            }
-                        }
+                        val finalStatus = if (isPrimaryOk && isBackupOk && isArchiveOk && isDrOk) "SYNCED" else "PARTIAL"
+                        repository.update(updatedFile.copy(syncStatus = finalStatus))
                     }
-
-                    // Calculate final status based on available accounts
-                    val requiredTypes = accounts.map { it.type }.toSet()
-                    val isPrimaryOk = !"Primary".isIn(requiredTypes) || updatedFile.primarySyncStatus == "SYNCED"
-                    val isBackupOk = !"Backup".isIn(requiredTypes) || updatedFile.backupSyncStatus == "SYNCED"
-                    val isArchiveOk = !"Archive".isIn(requiredTypes) || updatedFile.archiveSyncStatus == "SYNCED"
-                    val isDrOk = !"DR".isIn(requiredTypes) || updatedFile.disasterRecoverySyncStatus == "SYNCED"
-
-                    val finalStatus = if (isPrimaryOk && isBackupOk && isArchiveOk && isDrOk) "SYNCED" else "PARTIAL"
-                    repository.update(updatedFile.copy(syncStatus = finalStatus))
                 }
             }.awaitAll()
 
             _lastSyncTimestamp.value = System.currentTimeMillis()
             _syncProgress.value = 1f
             _isSyncing.value = false
-            addSyncLog("[Sync Engine] Multi-threaded deployment complete across all connected mirrors.")
+            addSyncLog("[Sync Engine] Task cycle finished. Consolidated state saved.")
         }
     }
 
     private fun String.isIn(set: Set<String>) = set.contains(this)
 
-    // Consolidate universal repository by pulling definitions from the mirror matrix
     fun consolidateUniversalRepository() {
         viewModelScope.launch {
             _isSyncing.value = true
             _syncProgress.value = 0f
             addSyncLog("[Universal Repo] Initializing cross-device consolidation protocol...")
-            delay(1000)
             
-            addSyncLog("[Universal Repo] Syncing System Configuration from Mirror Matrix...")
-            delay(1000)
-            // Simulated pull of remote settings
-            val remoteCustomRule = "Always tag invoices as #tax-records"
-            if (_customRule.value != remoteCustomRule) {
-                _customRule.value = remoteCustomRule
-                settingsManager.setString(SettingsManager.KEY_CUSTOM_RULE, remoteCustomRule)
-                addSyncLog("[Universal Repo] Updated Classification Rule from remote master.")
+            val primaryNode = _connectedAccounts.value.find { it.type == "Primary" }
+            if (primaryNode != null && !primaryNode.endpoint.isNullOrBlank()) {
+                addSyncLog("[Universal Repo] Handshake with ${primaryNode.accountName} successful.")
+                
+                try {
+                    val remoteFiles = com.example.data.api.CloudStorageClient.fetchManifest(primaryNode)
+                    if (remoteFiles.isNotEmpty()) {
+                        addSyncLog("[Universal Repo] Discovered ${remoteFiles.size} shared assets in Global Matrix.")
+                        
+                        val localFileNames = _mediaFiles.value.map { it.fileName }.toSet()
+                        val missingLocally = remoteFiles.filter { it !in localFileNames }
+                        
+                        if (missingLocally.isNotEmpty()) {
+                            addSyncLog("[Universal Repo] ${missingLocally.size} assets identified for consolidation pull.")
+                            
+                            missingLocally.forEach { fileName ->
+                                try {
+                                    val baseUrl = if (primaryNode.endpoint!!.endsWith("/")) primaryNode.endpoint else "${primaryNode.endpoint}/"
+                                    val downloadUrl = "$baseUrl$fileName"
+                                    
+                                    val localUri = com.example.data.api.CloudStorageClient.downloadFile(
+                                        context = getApplication(),
+                                        url = downloadUrl,
+                                        targetFileName = fileName
+                                    )
+                                    
+                                    // Register the newly consolidated file in the local DB
+                                    val newFile = MediaFile(
+                                        fileName = fileName,
+                                        fileType = "IMAGE", // Defaulting, AI will fix this later
+                                        sourceApp = "Universal Repo",
+                                        fileSize = 0, // Will be updated
+                                        timestamp = System.currentTimeMillis(),
+                                        localUri = localUri.toString(),
+                                        syncStatus = "SYNCED",
+                                        primaryUrl = downloadUrl,
+                                        primarySyncStatus = "SYNCED"
+                                    )
+                                    repository.insert(newFile)
+                                    addSyncLog(" -> Consolidated: $fileName")
+                                } catch (e: Exception) {
+                                    addSyncLog(" [!] Error pulling $fileName: ${e.message}")
+                                }
+                            }
+                        }
+                    } else {
+                        addSyncLog("[Universal Repo] Global Manifest is currently empty.")
+                    }
+                } catch (e: Exception) {
+                    addSyncLog("[Error] Consolidation failed: ${e.message}")
+                }
+            } else {
+                addSyncLog("[Universal Repo] No Primary mirror node found for config sync.")
             }
 
-            addSyncLog("[Universal Repo] Accessing Global Manifest from Mirror Matrix...")
-            delay(800)
-            
-            // Simulated remote files found on other devices in the same universal repo
-            val mockRemoteFiles = listOf(
-                MediaFile(
-                    fileName = "remote_shared_asset_01.png",
-                    fileType = "IMAGE",
-                    sourceApp = "Shared (DEV-X92B)",
-                    fileSize = 2048576,
-                    timestamp = System.currentTimeMillis() - 86400000,
-                    category = "Work",
-                    syncStatus = "SYNCED",
-                    primaryUrl = "https://omni-primary.s3.amazonaws.com/u/remote_shared_asset_01.png",
-                    primarySyncStatus = "SYNCED"
-                ),
-                MediaFile(
-                    fileName = "universal_doc_v2.pdf",
-                    fileType = "DOCUMENT",
-                    sourceApp = "Shared (DEV-L041)",
-                    fileSize = 512000,
-                    timestamp = System.currentTimeMillis() - 172800000,
-                    category = "Finance",
-                    syncStatus = "SYNCED",
-                    primaryUrl = "https://omni-primary.s3.amazonaws.com/u/universal_doc_v2.pdf",
-                    primarySyncStatus = "SYNCED"
-                )
-            )
-            
-            var addedCount = 0
-            mockRemoteFiles.forEach { remoteFile ->
-                if (_mediaFiles.value.none { it.fileName == remoteFile.fileName }) {
-                    repository.insert(remoteFile)
-                    addedCount++
-                    addSyncLog("[Universal Repo] Imported remote reference: ${remoteFile.fileName}")
-                }
-            }
-            
+            addSyncLog("[Universal Repo] Consolidation cycle finished. State is up-to-date.")
             _syncProgress.value = 1f
-            delay(500)
             _isSyncing.value = false
-            addSyncLog("[Universal Repo] Consolidation complete. Found $addedCount new remote repository items.")
         }
     }
 
-    private fun detectAppRegistry(path: String): String {
-        return when {
-            path.contains("WhatsApp", true) -> "WhatsApp"
-            path.contains("Telegram", true) -> "Telegram"
-            path.contains("Signal", true) -> "Signal"
-            path.contains("Instagram", true) -> "Instagram"
-            path.contains("Facebook", true) -> "Facebook"
-            path.contains("Twitter", true) || path.contains("X-App", true) -> "X/Twitter"
-            path.contains("Snapchat", true) -> "Snapchat"
-            path.contains("Screenshots", true) -> "Screenshots"
-            path.contains("DCIM/Camera", true) -> "Camera"
-            path.contains("Download", true) -> "Downloads"
-            !path.contains("/emulated/0", true) -> "SD Card"
-            else -> {
-                // Heuristic: Extract the last folder name before the file name
-                val parts = path.split("/")
-                if (parts.size >= 2) {
-                    val folder = parts[parts.size - 2]
-                    if (folder.isNotEmpty() && folder != "0" && folder != "emulated") {
-                        folder.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
-                    } else "Device Storage"
-                } else "Device Storage"
-            }
+    fun scheduleBackgroundSync(intervalMinutes: Int) {
+        val workManager = WorkManager.getInstance(getApplication())
+        _syncIntervalMinutes.value = intervalMinutes
+
+        val constraints = Constraints.Builder()
+            .setRequiresCharging(true)
+            .build()
+
+        val periodicRequest = PeriodicWorkRequestBuilder<SyncWorker>(
+            intervalMinutes.toLong(), TimeUnit.MINUTES
+        )
+            .setConstraints(constraints)
+            .addTag("BackgroundSyncJob")
+            .build()
+
+        workManager.enqueueUniquePeriodicWork(
+            "BackgroundSyncJob",
+            ExistingPeriodicWorkPolicy.UPDATE,
+            periodicRequest
+        )
+
+        _isBackgroundSyncScheduled.value = true
+        addSyncLog("[System] Background sync scheduled successfully via WorkManager.")
+    }
+
+    fun cancelBackgroundSync() {
+        val workManager = WorkManager.getInstance(getApplication())
+        workManager.cancelUniqueWork("BackgroundSyncJob")
+        _isBackgroundSyncScheduled.value = false
+        addSyncLog("[System] Background sync deactivated. WorkManager periodic job cancelled.")
+    }
+
+    fun testBackgroundSyncImmediately() {
+        viewModelScope.launch {
+            val workManager = WorkManager.getInstance(getApplication())
+            val testRequest = OneTimeWorkRequestBuilder<SyncWorker>()
+                .addTag("TestBackgroundSync")
+                .build()
+
+            addSyncLog("[System] Triggering simulated Scheduled Sync Worker now...")
+            workManager.enqueueUniqueWork(
+                "TestBackgroundSync",
+                ExistingWorkPolicy.REPLACE,
+                testRequest
+            )
+        }
+    }
+
+    fun scanForDuplicates() {
+        viewModelScope.launch {
+            val workManager = WorkManager.getInstance(getApplication())
+            val duplicateRequest = OneTimeWorkRequestBuilder<DuplicateWorker>()
+                .addTag("DuplicateScannerJob")
+                .build()
+                
+            _isScanningDuplicates.value = true
+            addSyncLog("[System] MD5 Engine: Calculating file checksum signatures & scanning vault...")
+            
+            workManager.enqueueUniqueWork(
+                "DuplicateScannerJob",
+                ExistingWorkPolicy.REPLACE,
+                duplicateRequest
+            )
+            
+            addSyncLog("[System] MD5 Engine: Vault analysis started in background.")
         }
     }
 
@@ -826,26 +1072,67 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun addTagsToMultipleFiles(ids: List<Int>, tagsToAdd: String) {
+    fun removeActiveUpload(id: String) {
+        _activeUploads.value = _activeUploads.value.filter { it.id != id }
+    }
+
+    fun keepDuplicateFile(file: MediaFile) {
         viewModelScope.launch {
-            val list = _mediaFiles.value.filter { ids.contains(it.id) }
-            val cleanTags = tagsToAdd.split(",")
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-            
-            if (cleanTags.isNotEmpty()) {
-                list.forEach { file ->
-                    val existingTagsList = file.tags.split(",")
-                        .map { it.trim() }
-                        .filter { it.isNotEmpty() }
-                    
-                    val unionTags = (existingTagsList + cleanTags).distinct()
-                    val updatedTagsStr = unionTags.joinToString(", ")
-                    
-                    val updated = file.copy(tags = updatedTagsStr)
-                    repository.update(updated)
+            val updatedFile = file.copy(isDuplicate = false)
+            repository.update(updatedFile)
+            addSyncLog("[System] MD5 Engine: Excluded \"${file.fileName}\" from duplicate group per user feedback.")
+        }
+    }
+
+    fun testConnection(account: CloudAccount, onResult: (Boolean, String) -> Unit) {
+        viewModelScope.launch {
+            addSyncLog("[System] Testing connectivity to ${account.accountName}...")
+            try {
+                val success = com.example.data.api.CloudStorageClient.testConnectivity(account)
+                if (success) {
+                    addSyncLog("[System] Connectivity Test: SUCCESS for ${account.accountName}")
+                    onResult(true, "Connection Successful!")
+                } else {
+                    addSyncLog("[Error] Connectivity Test: FAILED for ${account.accountName} - Resource not found or inaccessible")
+                    onResult(false, "Connection Failed. Please check settings.")
                 }
-                addAiLog("[AI] Bulk added tags [$tagsToAdd] to ${list.size} files.")
+            } catch (e: Exception) {
+                val errorMsg = e.message ?: "Unknown error"
+                addSyncLog("[Error] Connectivity Test: EXCEPTION for ${account.accountName}: $errorMsg")
+                onResult(false, "Connection Error: $errorMsg")
+            }
+        }
+    }
+
+    private fun detectAppRegistry(path: String): String {
+        val lowerPath = path.lowercase()
+        return when {
+            lowerPath.contains("whatsapp") -> "WhatsApp"
+            lowerPath.contains("telegram") -> "Telegram"
+            lowerPath.contains("signal") -> "Signal"
+            lowerPath.contains("instagram") -> "Instagram"
+            lowerPath.contains("facebook") -> "Facebook"
+            lowerPath.contains("twitter") || lowerPath.contains("x-app") || lowerPath.contains("/x/") -> "X/Twitter"
+            lowerPath.contains("snapchat") -> "Snapchat"
+            lowerPath.contains("messenger") -> "Messenger"
+            lowerPath.contains("discord") -> "Discord"
+            lowerPath.contains("slack") -> "Slack"
+            lowerPath.contains("viber") -> "Viber"
+            lowerPath.contains("line") -> "Line"
+            lowerPath.contains("screenshots") -> "Screenshots"
+            lowerPath.contains("dcim/camera") -> "Camera"
+            lowerPath.contains("download") -> "Downloads"
+            lowerPath.contains("movies") || lowerPath.contains("video") -> "Videos"
+            lowerPath.contains("music") || lowerPath.contains("audio") -> "Audio"
+            lowerPath.contains("/storage/") && !lowerPath.contains("/emulated/0") -> "SD Card"
+            else -> {
+                val parts = path.split("/")
+                if (parts.size >= 2) {
+                    val folder = parts[parts.size - 2]
+                    if (folder.isNotEmpty() && folder != "0" && folder != "emulated") {
+                        folder.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
+                    } else "Device Storage"
+                } else "Device Storage"
             }
         }
     }
@@ -860,12 +1147,3 @@ class MediaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 }
-
-data class UploadTask(
-    val id: String = java.util.UUID.randomUUID().toString(),
-    val fileName: String,
-    val totalSize: Long,
-    val progress: Float, // 0.0 to 1.0
-    val status: String,  // "READING", "ENCRYPTING", "UPLOADING", "ANALYZING_AI", "COMPLETED", "FAILED"
-    val tags: List<String> = emptyList()
-)

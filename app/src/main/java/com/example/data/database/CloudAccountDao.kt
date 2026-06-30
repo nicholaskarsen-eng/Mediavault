@@ -8,6 +8,9 @@ interface CloudAccountDao {
     @Query("SELECT * FROM cloud_accounts")
     fun getAllAccounts(): Flow<List<CloudAccount>>
 
+    @Query("SELECT * FROM cloud_accounts")
+    suspend fun getAllAccountsDirect(): List<CloudAccount>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertAccount(account: CloudAccount)
 
